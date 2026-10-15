@@ -275,6 +275,7 @@ Open questions for the owner:
 
 - [ ] Which raft performance numbers to adopt from Dewan and Hosler 2008? Until the article is read, raft runs use the provisional values in `configs/vessels.yaml` (closest angle 85°, at most 4 knots).
 - [ ] Confirm the departure points and steering targets proposed above, especially the Tuamotu atoll: Pukarua in the east, or the Palliser group, which has an admixture date.
+- [ ] Should hold course keep the canoe near the direct line to its target? As written, it keeps whichever tack points closer to the target. On a long beat against steady trades that tack stays closer for the whole passage, so the canoe can end up 5–10° of latitude off its target; the synthetic demo shows this from Fatu Hiva toward Ecuador. A rule that tacks back when the canoe strays more than a set distance from the direct line may be closer to how navigators worked.
 - [ ] Ask a Pacific voyaging researcher to review the strategy rules before the full grid, and ask the Polynesian Voyaging Society for logs or tracker positions to fit the canoe speed table?
 - [ ] Publish the results, or keep them as a personal study?
 
