@@ -4,7 +4,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from voyage_sim import analyze
+from voyage_sim import analyze, enso, geo
+from voyage_sim.simulate import AT_SEA, DID_NOT_SAIL, END_ALL_SIGHTED
 
 NAN = np.nan
 GROUPS = ["Marquesas", "Marquesas", "Coast: Ecuador"]  # landmass index -> group
@@ -155,7 +156,8 @@ def _row(df, rule, supply, month):
 def test_summarize_hand_worked_cells():
     df = analyze.summarize(_results(), _labels(), rules=["r20", 1], supplies=[30, 60], by=("month",))
     assert list(df.columns) == [
-        "rule", "supply_days", "month", "p", "lo", "hi", "n", "n_years", "median_days", "p90_days",
+        "rule", "supply_days", "month", "p", "lo", "hi", "n", "n_years", "n_events", "share_not_sailed",
+        "median_days", "p90_days",
     ]
     assert len(df) == 2 * 2 * 2
     assert list(df.rule) == ["r20"] * 4 + ["r40"] * 4
@@ -183,12 +185,15 @@ def test_summarize_destination_filter_and_overall_cell():
         _results(), _labels(), rules=["r40"], supplies=[60], dest_groups=["Coast: Ecuador"], by=()
     )
     assert list(df.columns) == [
-        "rule", "supply_days", "p", "lo", "hi", "n", "n_years", "median_days", "p90_days",
+        "rule", "supply_days", "p", "lo", "hi", "n", "n_years", "n_events", "share_not_sailed",
+        "median_days", "p90_days",
     ]
     (r,) = df.itertuples()
     # Ecuador sightings within 60 days: voyages 1, 6, 7 (days 25, 55, 58).
     assert (r.p, r.n, r.n_years) == (3 / 8, 8, 2)
     assert r.median_days == 55.0
+    # No ENSO cells: no event count.
+    assert pd.isna(r.n_events) and r.share_not_sailed == 0.0
 
 
 def test_summarize_default_month_and_enso_cells_keep_unlabelled_voyages():
@@ -218,3 +223,87 @@ def test_summarize_is_deterministic_and_aligns_labels_by_voyage_id():
     pd.testing.assert_frame_equal(a, analyze.summarize(_results(), shuffled, **kw))
     with pytest.raises(ValueError):
         analyze.summarize(_results(), _labels().drop(columns="voyage_id").iloc[:7], **kw)
+
+
+def test_share_not_sailed_counts_did_not_sail_as_failures():
+    res = _results()
+    # Voyages 2 and 5 never left port; neither has a sighting under r20.
+    res.status = np.array([END_ALL_SIGHTED, AT_SEA, DID_NOT_SAIL, AT_SEA, AT_SEA, DID_NOT_SAIL, AT_SEA, AT_SEA])
+    res.hit_days[:, [2, 5]] = NAN
+    res.hit_landmass[:, [2, 5]] = -1
+    df = analyze.summarize(res, _labels(), rules=["r20"], supplies=[90], by=("month",))
+    assert list(df.share_not_sailed) == [0.25, 0.25]
+    # They stay in the denominator: January has sightings by voyages 0, 1, 3 of 4.
+    assert _row(df, "r20", 90, 1).p == 0.75
+
+
+def test_summarize_without_voyages_gives_an_empty_overall_cell(recwarn):
+    res = SimpleNamespace(voyage_id=np.zeros(0, int), launch_t=np.zeros(0), status=np.zeros(0, int),
+                          rule_names=["r40"], landmass_groups=GROUPS, hit_days=np.zeros((1, 0)),
+                          hit_landmass=np.zeros((1, 0), int))
+    labels = analyze.launch_labels(res)
+    (r,) = analyze.summarize(res, labels, ["r40"], [60], by=()).itertuples()
+    assert (r.n, r.n_years) == (0, 0) and np.isnan(r.p) and np.isnan(r.share_not_sailed)
+    assert analyze.summarize(res, labels, ["r40"], [60]).empty
+    assert not recwarn.list
+
+
+# --- launch labels and events ----------------------------------------------------
+
+def _monthly_phases(start, codes):
+    names = {"E": enso.EL_NINO, "L": enso.LA_NINA, "N": enso.NEUTRAL}
+    return pd.Series([names[c] for c in codes], index=pd.period_range(start, periods=len(codes), freq="M"))
+
+
+def test_launch_labels_from_launch_times():
+    t = geo.to_epoch_hours(
+        np.array(["1997-06-30T23:00", "1997-07-01", "1998-01-15", "1998-06-30", "2001-03-01"], dtype="datetime64[s]")
+    )
+    res = SimpleNamespace(voyage_id=np.arange(10, 15), launch_t=t)
+    phases = _monthly_phases("1997-06", "NEEEEEEEEN")  # El Nino Jul 1997 - Feb 1998
+    index = pd.Series([0.3, 0.7, 2.4], index=pd.period_range("1997-06", periods=3, freq="M"))
+    lab = analyze.launch_labels(res, phases, index)
+    assert list(lab.columns) == ["voyage_id", "month", "enso", "year", "index", "event"]
+    assert list(lab.voyage_id) == [10, 11, 12, 13, 14]
+    assert list(lab.month) == [6, 7, 1, 6, 3]
+    assert list(lab.enso) == ["neutral", "el_nino", "el_nino", "unknown", "unknown"]
+    assert list(lab.year) == [1996, 1997, 1997, 1997, 2000]
+    np.testing.assert_allclose(lab["index"], [0.3, 0.7, NAN, NAN, NAN])
+    assert list(lab.event.fillna("-")) == ["-", "el_nino:1997-07", "el_nino:1997-07", "-", "-"]
+    bare = analyze.launch_labels(res)
+    assert (bare.enso == "unknown").all() and bare["index"].isna().all() and bare.event.isna().all()
+    pd.testing.assert_series_equal(bare.year, lab.year)
+
+
+def test_events_are_maximal_same_phase_runs_of_consecutive_months():
+    phases = _monthly_phases("2000-01", "EEELLNEEE")
+    # A missing month (dropped from the series) also ends a run.
+    phases = pd.concat([phases, _monthly_phases("2000-11", "EE")])
+    ev = analyze._events(phases)
+    assert list(ev.index.astype(str)) == [
+        "2000-01", "2000-02", "2000-03", "2000-04", "2000-05", "2000-07", "2000-08", "2000-09", "2000-11", "2000-12",
+    ]
+    assert list(ev) == ["el_nino:2000-01"] * 3 + ["la_nina:2000-04"] * 2 + ["el_nino:2000-07"] * 3 + [
+        "el_nino:2000-11"
+    ] * 2
+    assert analyze._events(phases.iloc[:0]).empty
+
+
+def test_summarize_counts_distinct_events_in_el_nino_and_la_nina_cells():
+    # Eight voyages, one per month from Jan 2000: an El Nino (Jan-Mar), a La
+    # Nina (Apr-May), neutral (Jun), then a second El Nino (Jul-Aug).
+    t = geo.to_epoch_hours(pd.date_range("2000-01-01", periods=8, freq="MS").to_numpy() + np.timedelta64(9, "D"))
+    res = _results()
+    res.launch_t = t
+    lab = analyze.launch_labels(res, _monthly_phases("2000-01", "EEELLNEE"))
+    df = analyze.summarize(res, lab, rules=["r40"], supplies=[90], by=("enso",))
+    counts = dict(zip(df.enso, df.n_events))
+    assert counts["el_nino"] == 2 and counts["la_nina"] == 1 and pd.isna(counts["neutral"])
+    assert df.n_events.dtype == "Int64"
+    # Cells split by month see one event each; without enso among the cells, none are counted.
+    by_month = analyze.summarize(res, lab, rules=["r40"], supplies=[90], by=("month", "enso"))
+    assert list(by_month.n_events.fillna(-1)) == [1, 1, 1, 1, 1, -1, 1, 1]
+    assert analyze.summarize(res, lab, rules=["r40"], supplies=[90], by=("month",)).n_events.isna().all()
+    # Labels without an event column report no event counts.
+    no_events = analyze.summarize(res, lab.drop(columns="event"), rules=["r40"], supplies=[90], by=("enso",))
+    assert no_events.n_events.isna().all()

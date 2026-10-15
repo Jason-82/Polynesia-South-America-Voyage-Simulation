@@ -4,7 +4,8 @@ A voyage makes landfall under a sighting rule when it first comes within that
 rule's radius of a shoreline. The radius is either one number for every
 landmass (the 20/40/60 km sensitivity runs) or, per landmass, the distance at
 which a target of its height clears the horizon for a lookout at a given eye
-height, with standard refraction.
+height, with standard refraction; islands and atolls (not coasts) are also
+betrayed by their seabirds out to a fixed bird range, whichever is larger.
 
 Distances to thousands of kilometres of coastline are too slow to compute for
 every voyage at every step, so each rule gets a ``SightingRaster``: the
@@ -131,7 +132,8 @@ class SightingRule:
     radius_km: float = 40.0    # uniform mode
     eye_height_m: float = 3.0
     refraction_k: float = 0.13
-    scale: float = 1.0         # multiplies height-based radii (sensitivity)
+    scale: float = 1.0         # multiplies height-based radii, bird range included (sensitivity)
+    bird_km: float = 0.0       # height mode: islands and atolls are in sight at least this far off
     floor_km: float = 0.0
     cap_km: float = np.inf
 
@@ -139,17 +141,26 @@ class SightingRule:
         if self.mode not in SIGHTING_MODES:
             raise ValueError(f"sighting rule {self.name!r}: mode must be one of {SIGHTING_MODES}")
         if not (0 < self.radius_km < np.inf and 0 <= self.eye_height_m < np.inf and 0 <= self.refraction_k < 1
-                and 0 < self.scale < np.inf and 0 <= self.floor_km <= self.cap_km):
+                and 0 < self.scale < np.inf and 0 <= self.bird_km < np.inf and 0 <= self.floor_km <= self.cap_km):
             raise ValueError(f"sighting rule {self.name!r}: need radius_km > 0, eye_height_m >= 0, "
-                             "0 <= refraction_k < 1, scale > 0 and 0 <= floor_km <= cap_km")
+                             "0 <= refraction_k < 1, scale > 0, bird_km >= 0 and 0 <= floor_km <= cap_km")
 
-    def radius_km_for(self, height_m) -> np.ndarray:
-        """Sighting radius (km) for landmasses of the given heights (m)."""
-        height = np.asarray(height_m, dtype=float)
+    def radius_km_for(self, height_m, kind) -> np.ndarray:
+        """Sighting radius (km) for landmasses of the given heights (m) and kinds.
+
+        Uniform mode: ``radius_km`` for every landmass. Height mode: the visual
+        range, or for islands and atolls ``bird_km`` if larger (seabirds fishing
+        off a coast say nothing about where it is), times ``scale``, then
+        clipped to [floor_km, cap_km].
+        """
+        height, kind = np.broadcast_arrays(np.asarray(height_m, dtype=float), np.asarray(kind, dtype=str))
+        if not np.isin(kind, LANDMASS_KINDS).all():
+            raise ValueError(f"landmass kinds must be among {LANDMASS_KINDS}")
         if self.mode == "uniform":
             return np.full(height.shape, float(self.radius_km))
-        rng = geometric_range_km(height, self.eye_height_m, self.refraction_k)
-        return np.clip(self.scale * rng, self.floor_km, self.cap_km)
+        visual = geometric_range_km(height, self.eye_height_m, self.refraction_k)
+        reach = np.maximum(visual, np.where(kind == "coast", 0.0, self.bird_km))
+        return np.clip(self.scale * reach, self.floor_km, self.cap_km)
 
 
 # --- rasters ------------------------------------------------------------------
@@ -237,7 +248,7 @@ class SightingRaster:
         ny, nx = _grid_shape(bounds, res_deg)
         lon_c = lon_min + (np.arange(nx) + 0.5) * res_deg
         lat_c = lat_min + (np.arange(ny) + 0.5) * res_deg
-        radii = rule.radius_km_for([lm.height_m for lm in landmasses])
+        radii = rule.radius_km_for([lm.height_m for lm in landmasses], [lm.kind for lm in landmasses])
         margin = np.full((ny, nx), float(cap_km))
         index = np.full((ny, nx), -1, dtype=np.int16 if len(landmasses) < 2**15 else np.int32)
         for k, (lm, radius) in enumerate(zip(landmasses, radii)):
@@ -329,16 +340,21 @@ class LandfallDetector:
             if r.index.size and r.index.max() >= len(self.landmasses):
                 raise ValueError(f"raster {r.rule_name!r} refers to more than {len(self.landmasses)} landmasses")
 
-    def check_segment(self, lon0, lat0, lon1, lat1, origin_group, armed, active):
+    def check_segment(self, lon0, lat0, lon1, lat1, origin_group, armed, active, eligible=None, rules=None):
         """Where along each step's segment land first comes into sight, per rule.
 
         The segment runs linearly in lon/lat from (lon0, lat0) to (lon1, lat1).
-        ``origin_group`` is each voyage's home group index (-1 for none);
-        ``armed`` and ``active`` are bool, shape (n,) or (n_rules, n).
+        ``origin_group`` is each voyage's home group index (-1 for none).
+        ``eligible``, optional (n, n_groups) bool, marks the groups each voyage
+        may land on (its destinations); land of other groups is sailed past,
+        though it still keeps a voyage from being out of sight of all land.
+        ``rules`` lists the raster indices to check (default all, in order);
+        ``armed`` and ``active`` are bool, shape (n,) or (len(rules), n).
 
-        Returns ``(hit, frac, landmass, armed_new)``, each (n_rules, n): whether
-        land came into sight, where along the segment (frac in [0, 1], NaN if
-        not), which landmass (-1 if not), and the updated armed flags.
+        Returns ``(hit, frac, landmass, armed_new)``, each (len(rules), n):
+        whether land that counts came into sight, where along the segment (frac
+        in [0, 1], NaN if not), which landmass (-1 if not), and the updated
+        armed flags.
 
         A segment is skipped, as wholly out of sight, when
         ``min(margin_start, margin_end) > 0.75 * length + cell_km``. That is
@@ -354,11 +370,31 @@ class LandfallDetector:
         of all land (margin > 0) at some point, in an earlier step or earlier in
         this segment. Inactive voyages, and segments with a non-finite end, get
         no sighting and keep their armed flag.
+
+        Limitation: a raster keeps only the landmass of smallest margin per
+        cell, so where an eligible landmass's sighting zone overlaps that of an
+        ineligible one with a smaller margin there (or of a home landmass not
+        yet armed), the eligible one is sighted only where its own margin takes
+        over. In the study area that would matter for small islands just off the
+        American coast (Gorgona, La Plata, Isla Mocha, ...) if they were grouped
+        apart from their coast segment (the catalog joins them to it): each would
+        hide the coast behind it along 40-150 km of shore, where the coast would
+        be sighted 10-60 km later, or not at all. Eastern Polynesian groups lie
+        hundreds of km from non-destination land.
         """
         lon0, lat0, lon1, lat1 = np.broadcast_arrays(
             *(np.asarray(x, dtype=float) for x in (lon0, lat0, lon1, lat1)))
+        n = lon0.shape[0]
         origin_group = np.broadcast_to(np.asarray(origin_group), lon0.shape)
-        shape = (len(self.rasters), lon0.shape[0])
+        rasters = list(self.rasters) if rules is None else [self.rasters[r] for r in rules]
+        if eligible is not None:
+            eligible = np.asarray(eligible, dtype=bool)
+            if eligible.shape != (n, len(self.groups)):
+                raise ValueError(f"eligible must have shape (n, n_groups) = {(n, len(self.groups))}, "
+                                 f"got {eligible.shape}")
+            # A trailing False column for group -1 (no landmass).
+            eligible = np.hstack([eligible, np.zeros((n, 1), dtype=bool)])
+        shape = (len(rasters), n)
         armed_new = np.broadcast_to(np.asarray(armed, dtype=bool), shape).copy()
         finite = np.isfinite(lon0) & np.isfinite(lat0) & np.isfinite(lon1) & np.isfinite(lat1)
         active = np.broadcast_to(np.asarray(active, dtype=bool), shape) & finite
@@ -369,7 +405,7 @@ class LandfallDetector:
         length = geo.haversine_km(lon0, lat0, lon1, lat1)
         dlon = geo.angle_diff(lon1, lon0)
         dlat = lat1 - lat0
-        for r, raster in enumerate(self.rasters):
+        for r, raster in enumerate(rasters):
             m_start, _ = raster.query(lon0, lat0)
             m_end, _ = raster.query(lon1, lat1)
             far = np.minimum(m_start, m_end) > 0.75 * length + raster.cell_km
@@ -386,20 +422,22 @@ class LandfallDetector:
             m, idx = raster.query(lon, lat)
             out_of_sight = m > 0
             armed_so_far = armed_new[r, cand][:, None] | np.logical_or.accumulate(out_of_sight, axis=1)
-            foreign = self._group_of[idx] != origin_group[cand, None]
-            eligible = ~out_of_sight & (idx >= 0) & (foreign | armed_so_far)
+            group = self._group_of[idx]
+            counts = ~out_of_sight & (idx >= 0) & ((group != origin_group[cand, None]) | armed_so_far)
+            if eligible is not None:
+                counts &= eligible[cand[:, None], group]
 
             rows = np.arange(cand.size)
-            k = eligible.argmax(axis=1)
+            k = counts.argmax(axis=1)
             kp = np.maximum(k - 1, 0)
             m_prev, m_k = m[rows, kp], m[rows, k]
             # Interpolate the zero crossing when the previous sample was out of sight; otherwise
-            # (first sample, or a switch from a home landmass to another) the sighting is at sample k.
+            # (first sample, or a switch from land that does not count) the sighting is at sample k.
             crossing = (k > 0) & (m_prev > 0)
             w = np.divide(m_prev, m_prev - m_k, out=np.ones_like(m_prev), where=crossing)
             f = t[rows, kp] + w * (t[rows, k] - t[rows, kp])
 
-            seen = eligible[rows, k]
+            seen = counts[rows, k]
             hit[r, cand] = seen
             frac[r, cand[seen]] = f[seen]
             landmass[r, cand[seen]] = idx[rows, k][seen]

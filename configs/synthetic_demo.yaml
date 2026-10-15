@@ -1,0 +1,151 @@
+# Synthetic demo: a small grid on made-up winds and currents, no downloads.
+#
+#   voyage-sim run configs/synthetic_demo.yaml      (or: python -m voyage_sim run ...)
+#
+# Two departures, each sailed by the upwind canoe holding course for the other
+# and drifted by the raft: Fatu Hiva -> Manta against the trades, Manta ->
+# Fatu Hiva with them. The land is the placeholder catalog (named islands as
+# circles, a coarse coast), the winds and currents the idealized
+# pacific_trades field of voyage_sim.run. It exercises the pipeline; its
+# numbers are not results. Runs in seconds (the first run also builds the two
+# sighting rasters, cached in outputs/cache).
+#
+# Schema of a grid config (read by voyage_sim.run.load_config)
+# ------------------------------------------------------------
+# Paths are relative to this file's directory. Missing optional keys take the
+# defaults shown; resolved_config.yaml in the output records every value.
+#
+# name: synthetic_demo        # outputs go to outputs/<name>/ (voyage-sim run --out overrides)
+# seed: 0                     # with each voyage id, keys every random draw
+# environment:                # winds and currents, one of:
+#   type: synthetic           #   an analytic field defined in voyage_sim.run (SYNTHETIC_FIELDS)
+#   field: pacific_trades
+#   params: {seasonal: true}  #   the field's keyword arguments
+#   wind_cap_ms: 50           #   winds faster than this are slowed to it (null: no cap)
+# environment:
+#   type: files               #   NetCDF files; each launch month reads only its own time window
+#   wind: {paths: ../data/era5/era5_uv10_*.nc, u: u10, v: v10}           # glob; variable names
+#   current: {paths: ../data/glorys/coarse/glorys_uv_*.nc, u: uo, v: vo}
+#   climatology: {path: ../data/glorys/current_climatology.nc, u: uo, v: vo}  # or null (default)
+#   climatology_before: 1993-01-01   # launches before this pair with the climatology (flagged)
+#   wind_cap_ms: 50
+# catalog:
+#   config: landmasses.yaml   # land: groups, regions, heights (voyage_sim.catalog)
+#   gshhg_dir: null           # unpacked GSHHG shorelines; null: the placeholder catalog
+#   cache_dir: null           # catalog and sighting rasters are cached here (null: no cache)
+# rules:                      # sighting rules (voyage_sim.landfall.SightingRule); the first is
+#   - {name: main, mode: height, bird_km: 37}   # the main rule, under which other land is recorded
+#   - {name: uniform40, mode: uniform, radius_km: 40}
+#   # also: eye_height_m (3), refraction_k (0.13), scale (1), floor_km (0), cap_km (.inf)
+# raster:                     # one sighting-margin raster per rule, cached by catalog and rule
+#   bounds: [-165, -65, -50, 30]   # lon_min, lon_max, lat_min, lat_max (default: the study domain)
+#   res_deg: 0.05
+#   cap_km: 250
+#   densify_km: 1.0           # shoreline vertex spacing for distances
+#   substep_km: 2.0           # sampling step of the swept-segment test
+# vessels: vessels.yaml
+# places: places.yaml         # departures and targets by name
+# launches:                   # the same schedule for every cell
+#   start: 2001-01-01         # first launch day
+#   end: 2001-12-31           # last possible launch day (inclusive)
+#   every_days: 1             # a launch day every N days
+#   per_day: 1                # voyages per launch day
+#   hour: 0                   # UTC
+# sim:                        # voyage_sim.simulate.SimConfig (max_days_at_sea is per cell)
+#   dt_hours: 6
+#   integrator: midpoint      # midpoint | euler
+#   speed_sd: 0.10            # per-voyage speed factor ~ N(1, sd)
+#   heading_sd_deg: 10        # steering error per 6-hour step
+#   diffusivity_m2s: 30       # random walk for unresolved currents
+#   track_every: 4            # record positions every N steps (0: no tracks)
+# analysis:
+#   supplies: [30, 60, 90, 120]   # supply limits (days); a cell uses those within its horizon
+#   by: [month]               # summary rows per value of these labels: month, enso, year (July-June,
+#                             # the bootstrap cluster), currents (synthetic, reanalysis or climatology)
+#   n_boot: 2000              # bootstrap replicates (resampling July-June launch years)
+#   enso_index: null          # CPC RONI/ONI text file (voyage-sim fetch enso); needed for by: enso
+# cells:                      # one run each; names are file names and --cells globs
+#   - name: fatuhiva_canoe75_hold
+#     departure: Fatu Hiva    # a departure in places.yaml; home is its group
+#     target: Manta           # a target in places.yaml, or null (drift, downwind need none)
+#     vessel: canoe_75        # a vessel in vessels.yaml
+#     strategy: {name: hold_course, tack_hysteresis_deg: 15}   # or just a name: drift
+#     destinations: {regions: [americas]}   # and/or groups: [...]: whose sighting ends a voyage
+#     max_days_at_sea: 120    # horizon: the longest supply limit
+
+name: synthetic_demo
+seed: 0
+
+environment:
+  type: synthetic
+  field: pacific_trades
+  params: {seasonal: true}
+  wind_cap_ms: 50
+
+catalog:
+  config: landmasses.yaml
+  gshhg_dir: null
+  cache_dir: ../outputs/cache
+
+rules:
+  - {name: main, mode: height, bird_km: 37}
+  - {name: uniform40, mode: uniform, radius_km: 40}
+
+raster:
+  bounds: [-165, -65, -50, 30]
+  res_deg: 0.05
+  cap_km: 250
+
+vessels: vessels.yaml
+places: places.yaml
+
+launches:
+  start: 2001-01-01
+  end: 2001-12-31
+  every_days: 7
+  per_day: 2
+  hour: 0
+
+sim:
+  dt_hours: 6
+  integrator: midpoint
+  speed_sd: 0.10
+  heading_sd_deg: 10
+  diffusivity_m2s: 30
+  track_every: 4
+
+analysis:
+  supplies: [30, 60, 90, 120]
+  by: [month]
+  n_boot: 2000
+  enso_index: null
+
+cells:
+  - name: fatuhiva_canoe75_hold
+    departure: Fatu Hiva
+    target: Manta
+    vessel: canoe_75
+    strategy: {name: hold_course, tack_hysteresis_deg: 15}
+    destinations: {regions: [americas]}
+    max_days_at_sea: 120
+  - name: fatuhiva_raft_drift
+    departure: Fatu Hiva
+    target: null
+    vessel: drift_raft
+    strategy: drift
+    destinations: {regions: [americas]}
+    max_days_at_sea: 120
+  - name: manta_canoe75_hold
+    departure: Manta
+    target: Fatu Hiva
+    vessel: canoe_75
+    strategy: {name: hold_course, tack_hysteresis_deg: 15}
+    destinations: {regions: [polynesia]}
+    max_days_at_sea: 120
+  - name: manta_raft_drift
+    departure: Manta
+    target: null
+    vessel: drift_raft
+    strategy: drift
+    destinations: {regions: [polynesia]}
+    max_days_at_sea: 120

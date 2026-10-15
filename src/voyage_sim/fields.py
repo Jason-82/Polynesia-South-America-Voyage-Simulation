@@ -12,7 +12,9 @@ surrounds a point the value is ``land_value`` (0 m/s current on land).
 
 GLORYS starts in 1993, so earlier wind years pair with a monthly current
 climatology (``monthly_climatology`` builds it, ``MonthlyClimatologyField``
-interpolates it between mid-month centres, cyclically through the year).
+interpolates it between mid-month centres, cyclically through the year). The
+same climatology field carries a last-millennium wind anomaly, which
+``SumField`` adds to the ERA5 winds.
 """
 
 from __future__ import annotations
@@ -249,12 +251,32 @@ def monthly_climatology(time, u, v) -> tuple[np.ndarray, np.ndarray]:
 
 
 @dataclass
+class SumField:
+    """Two fields added, e.g. ERA5 winds plus a monthly last-millennium anomaly; NaN where either is."""
+
+    a: VectorField
+    b: VectorField
+
+    def sample(self, lon, lat, t):
+        ua, va = self.a.sample(lon, lat, t)
+        ub, vb = self.b.sample(lon, lat, t)
+        return ua + ub, va + vb
+
+
+@dataclass
 class Environment:
     """The forcing a simulation runs in."""
 
     wind: VectorField  # 10 m wind
     current: VectorField  # surface current
     current_is_climatology: bool = False  # flagged in outputs (pre-1993 runs)
+    # ERA5 has rare spurious winds of up to ~300 m/s; the simulator caps the speed
+    # at this (keeping the direction) and counts the caps. None: no cap.
+    wind_cap_ms: float | None = 50.0
+
+    def __post_init__(self):
+        if self.wind_cap_ms is not None and not self.wind_cap_ms > 0:
+            raise ValueError(f"wind_cap_ms must be positive, or None for no cap; got {self.wind_cap_ms}")
 
 
 # --- helpers --------------------------------------------------------------------

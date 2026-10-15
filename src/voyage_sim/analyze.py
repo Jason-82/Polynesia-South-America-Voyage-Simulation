@@ -5,11 +5,14 @@ one run answers every combination: success under rule r with S days of
 supplies is ``hit_days[r] <= S`` (a sighting exactly at the limit counts),
 optionally restricted to landfalls in chosen island groups or coast segments.
 
-Voyages launched in the same year share that year's weather and ocean state,
-so they are not independent trials. Intervals therefore come from a cluster
-bootstrap that resamples whole launch years and recomputes the pooled success
+Voyages launched in the same season share its weather and ocean state, so
+they are not independent trials. Intervals therefore come from a cluster
+bootstrap that resamples whole July-June launch years (``enso.enso_year``, so
+one El Nino or La Nina event is one cluster) and recomputes the pooled success
 fraction (a ratio of sums); an ordinary bootstrap over voyages would be too
-narrow whenever outcomes are correlated within a year.
+narrow whenever outcomes are correlated within a year. Because the record
+holds only a handful of strong events, El Nino and La Nina cells also report
+how many distinct events their voyages come from.
 """
 
 from __future__ import annotations
@@ -18,6 +21,9 @@ from collections.abc import Iterable, Sequence
 
 import numpy as np
 import pandas as pd
+
+from . import enso, geo
+from .simulate import DID_NOT_SAIL
 
 
 def _rule_index(results, rule) -> int:
@@ -89,6 +95,58 @@ def duration_summary(days) -> dict:
     return dict(median=float(median), p90=float(p90), n=int(d.size))
 
 
+def launch_labels(results, phases: pd.Series | None = None, index: pd.Series | None = None) -> pd.DataFrame:
+    """Per-voyage labels for ``summarize``, from each voyage's launch time (UTC).
+
+    Columns: ``voyage_id``; ``month`` (1-12); ``enso``, the phase of the launch
+    month in ``phases`` (``enso.enso_phases`` output; ``"unknown"`` where it has
+    none, or without it); ``year``, the July-June year (``enso.enso_year``) that
+    clusters the bootstrap; ``index``, the launch month's index value (NaN where
+    missing, or without ``index``); and ``event``, the El Nino or La Nina event
+    the launch falls in, named by phase and first month (``"el_nino:1997-05"``),
+    missing outside one.
+    """
+    t = np.asarray(results.launch_t, dtype=float)
+    n = t.size
+    if phases is None:
+        phase = np.full(n, enso.UNKNOWN, dtype=object)
+        event = np.full(n, None, dtype=object)
+    else:
+        phase = enso.label_times(t, phases)
+        event = enso.label_times(t, _events(phases))
+        event[event == enso.UNKNOWN] = None
+    return pd.DataFrame(
+        {
+            "voyage_id": np.asarray(results.voyage_id),
+            "month": geo.month_of(t),
+            "enso": phase,
+            "year": enso.enso_year(t),
+            "index": np.full(n, np.nan) if index is None else enso.index_at_times(t, index),
+            "event": event,
+        }
+    )
+
+
+def _events(phases: pd.Series) -> pd.Series:
+    """Event name of each El Nino or La Nina month: its phase and the first month of its run.
+
+    An event is a maximal run of consecutive months with the same non-neutral
+    phase; a month missing from ``phases`` ends it, as it does in ``enso_phases``.
+    """
+    p = phases.dropna()
+    if not isinstance(p.index, pd.PeriodIndex):
+        p.index = pd.DatetimeIndex(p.index).to_period("M")
+    p = p.sort_index()
+    p.index = p.index.asfreq("M")
+    phase = p.to_numpy(dtype=object)
+    new = np.ones(len(p), dtype=bool)
+    new[1:] = (phase[1:] != phase[:-1]) | (np.diff(p.index.asi8) != 1)
+    first = np.maximum.accumulate(np.where(new, np.arange(len(p)), 0))
+    names = np.array([f"{ph}:{start}" for ph, start in zip(phase[first], p.index[first])], dtype=object)
+    keep = np.isin(phase, [enso.EL_NINO, enso.LA_NINA])
+    return pd.Series(names[keep], index=p.index[keep], dtype=object)
+
+
 def summarize(
     results,
     labels: pd.DataFrame,
@@ -104,10 +162,19 @@ def summarize(
     """One row per (rule, supply limit, ``by`` cell): odds, interval and days at sea.
 
     ``labels`` has one row per voyage, in results order or with a ``voyage_id``
-    column to align on, holding the ``by`` columns and ``year`` (the bootstrap
-    cluster). Durations are the days to first sighting of the successful
-    voyages in the cell. Rows are ordered by rule, supply limit, then sorted
-    cells; every cell reuses ``seed``, so reruns give identical intervals.
+    column to align on, holding the ``by`` columns and ``year``, the bootstrap
+    cluster. Pass the July-June year of each launch there (``enso.enso_year``,
+    as ``launch_labels`` does), so one El Nino or La Nina event is one cluster.
+
+    ``n_years`` counts the distinct clusters behind a cell. ``n_events`` counts
+    the distinct values of the labels' ``event`` column among the cell's
+    voyages in El Nino and La Nina cells (``enso`` among ``by``); it is NA in
+    other cells and without that column. ``share_not_sailed`` is the share of
+    the cell's voyages that gave up waiting in port (``DID_NOT_SAIL``); they
+    count as failures. Durations are the days to first sighting of the
+    successful voyages in the cell. Rows are ordered by rule, supply limit,
+    then sorted cells; every cell reuses ``seed``, so reruns give identical
+    intervals.
     """
     by = [by] if isinstance(by, str) else list(by)
     n = len(np.asarray(results.voyage_id))
@@ -122,18 +189,31 @@ def summarize(
     else:
         cells = [((), np.arange(n))]
 
+    not_sailed = np.asarray(results.status) == DID_NOT_SAIL
+    events = labels["event"].to_numpy(dtype=object) if "event" in labels.columns else None
+    cell_counts = []
+    for key, idx in cells:
+        n_events = pd.NA
+        if events is not None and "enso" in by and key[by.index("enso")] in (enso.EL_NINO, enso.LA_NINA):
+            e = events[idx]
+            n_events = len(set(e[pd.notna(e)]))
+        cell_counts.append((n_events, float(not_sailed[idx].mean()) if len(idx) else np.nan))
+
     rows = []
     for rule in rules:
         r = _rule_index(results, rule)
         days = np.asarray(results.hit_days)[r]
         for supply in supplies:
             ok = success(results, r, supply, dest_groups)
-            for key, idx in cells:
+            for (key, idx), (n_events, share_not_sailed) in zip(cells, cell_counts):
                 ci = cluster_bootstrap(ok[idx], years[idx], n_boot=n_boot, seed=seed, level=level)
                 dur = duration_summary(days[idx][ok[idx]])
                 rows.append(
-                    (results.rule_names[r], supply, *key, ci["p"], ci["lo"], ci["hi"],
-                     ci["n"], ci["n_clusters"], dur["median"], dur["p90"])
+                    (results.rule_names[r], supply, *key, ci["p"], ci["lo"], ci["hi"], ci["n"],
+                     ci["n_clusters"], n_events, share_not_sailed, dur["median"], dur["p90"])
                 )
-    columns = ["rule", "supply_days", *by, "p", "lo", "hi", "n", "n_years", "median_days", "p90_days"]
-    return pd.DataFrame(rows, columns=columns)
+    columns = ["rule", "supply_days", *by, "p", "lo", "hi", "n", "n_years", "n_events", "share_not_sailed",
+               "median_days", "p90_days"]
+    df = pd.DataFrame(rows, columns=columns)
+    df["n_events"] = df["n_events"].astype("Int64")
+    return df

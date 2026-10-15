@@ -60,15 +60,53 @@ def test_geometric_range_known_values():
 
 def test_sighting_rules():
     heights = np.array([0.0, 25.0, 1000.0])
-    np.testing.assert_array_equal(SightingRule("u40", mode="uniform").radius_km_for(heights), 40.0)
-    np.testing.assert_allclose(SightingRule("h").radius_km_for(heights), geometric_range_km(heights))
+    kinds = ["coast", "atoll", "island"]
+    np.testing.assert_array_equal(SightingRule("u40", mode="uniform").radius_km_for(heights, kinds), 40.0)
+    np.testing.assert_allclose(SightingRule("h").radius_km_for(heights, kinds), geometric_range_km(heights))
     # Scaled by half: [3.3, 12.9, 63.8] km, then floored at 10 and capped at 60.
     rule = SightingRule("h", scale=0.5, floor_km=10.0, cap_km=60.0)
-    np.testing.assert_allclose(rule.radius_km_for(heights), [10.0, 0.5 * geometric_range_km(25.0), 60.0])
+    np.testing.assert_allclose(rule.radius_km_for(heights, kinds), [10.0, 0.5 * geometric_range_km(25.0), 60.0])
     with pytest.raises(ValueError):
         SightingRule("bad", mode="visual")
     with pytest.raises(ValueError):
         SightingRule("bad", floor_km=50.0, cap_km=20.0)
+    with pytest.raises(ValueError):
+        SightingRule("bad", bird_km=-1.0)
+    with pytest.raises(ValueError, match="kinds"):
+        rule.radius_km_for(heights, ["coast", "atoll", "reef"])
+
+
+def test_bird_range_extends_islands_and_atolls_but_not_coasts():
+    # An 18 m atoll canopy clears the horizon at 22.9 km; its birds are seen out to 37 km.
+    assert geometric_range_km(18.0) == pytest.approx(22.87, abs=0.01)
+    heights = np.array([18.0, 18.0, 18.0, 1000.0])
+    kinds = np.array(["atoll", "island", "coast", "island"])
+    birds = SightingRule("h", bird_km=37.0)
+    np.testing.assert_allclose(birds.radius_km_for(heights, kinds),
+                               [37.0, 37.0, geometric_range_km(18.0), geometric_range_km(1000.0)])
+    # Scaling applies to the bird range too.
+    np.testing.assert_allclose(SightingRule("h", bird_km=37.0, scale=0.5).radius_km_for(heights, kinds),
+                               [18.5, 18.5, 0.5 * geometric_range_km(18.0), 0.5 * geometric_range_km(1000.0)])
+    # Then the floor and cap, as for visual ranges.
+    np.testing.assert_allclose(SightingRule("h", bird_km=37.0, floor_km=30.0, cap_km=100.0).radius_km_for(
+        heights, kinds), [37.0, 37.0, 30.0, 100.0])
+    # Uniform radii ignore height, kind and birds; a scalar kind serves every landmass.
+    np.testing.assert_array_equal(
+        SightingRule("u20", mode="uniform", radius_km=20.0, bird_km=37.0).radius_km_for(heights, kinds), 20.0)
+    np.testing.assert_allclose(birds.radius_km_for(heights, "coast"), geometric_range_km(heights))
+
+
+def test_raster_uses_each_landmass_kind():
+    # An atoll and a stretch of coast of the same height: only the atoll gets the bird range.
+    reef = Landmass("Reef", "Reefs", 18.0, [[(-148.0, -17.0)]], kind="atoll")
+    coast = Landmass("Shore", "Shore", 18.0, [[(-145.0, -19.0), (-145.0, -15.0)]], kind="coast")
+    raster = SightingRaster.build([reef, coast], SightingRule("h", bird_km=37.0), BOUNDS, res_deg=0.05,
+                                  cap_km=100.0)
+    np.testing.assert_allclose(raster.radius_km, [37.0, geometric_range_km(18.0)])
+    margin, index = raster.query(*offset(-148.0, -17.0, -50.0, 0.0))
+    assert index == 0 and margin == pytest.approx(13.0, abs=0.5)
+    margin, index = raster.query(*offset(-145.0, -17.0, -30.0, 0.0))
+    assert index == 1 and margin == pytest.approx(30.0 - geometric_range_km(18.0), abs=0.5)
 
 
 def test_circle_ring_is_closed_at_exact_distance():
@@ -113,7 +151,7 @@ def test_raster_index_is_argmin_of_margin_not_of_distance():
     high = Landmass("High", "B", 1000.0, [[(-145.0, -17.0)]])  # sighted from ~128 km, 213 km east of Low
     rule = SightingRule("h")
     raster = SightingRaster.build([low, high], rule, BOUNDS, res_deg=0.05, cap_km=150.0)
-    radius = rule.radius_km_for([5.0, 1000.0])
+    radius = rule.radius_km_for([5.0, 1000.0], "island")
     lon, lat = offset(-147.0, -17.0, np.array([30.0, 60.0]), 0.0)
     margins = np.stack([geo.haversine_km(lm.rings[0][0, 0], lm.rings[0][0, 1], lon, lat) - r
                         for lm, r in zip((low, high), radius)])
@@ -146,7 +184,7 @@ def test_raster_matches_brute_force_at_high_latitude():
     ring = coast.rings[0]
     s = np.linspace(0.0, 1.0, 4000)[:, None]
     pts = np.vstack([a + s * (b - a) for a, b in zip(ring[:-1], ring[1:])])
-    radius = rule.radius_km_for([0.0, 1000.0])
+    radius = rule.radius_km_for([0.0, 1000.0], ["coast", "island"])
     chord, _ = cKDTree(geo.lonlat_to_xyz(pts[:, 0], pts[:, 1])).query(
         geo.lonlat_to_xyz(glon, glat), distance_upper_bound=float(geo.km_to_chord(2 * cap)))
     to_coast = np.where(np.isfinite(chord), geo.chord_to_km(chord), np.inf) - radius[0]
@@ -337,6 +375,83 @@ def test_foreign_zone_overlapping_home_is_sighted_where_it_takes_over():
     np.testing.assert_array_equal(landmass[0], [1, 0])   # once armed, home counts from the start
     assert 13.5 < 5.0 + 20.0 * frac[0, 0] < 17.5 and frac[0, 1] == 0.0
     np.testing.assert_array_equal(armed[0], [False, True])
+
+
+def test_only_eligible_groups_are_sighted():
+    # Island A, 50 km east of the line's origin, and island B at 120 km: 2 km rims, 20 km zones, so
+    # land is in sight from 28 to 72 km (A) and from 98 to 142 km (B) along the line.
+    def east(km):
+        lon, lat = offset(ATOLL_LON, ATOLL_LAT, np.asarray(km, dtype=float), 0.0)
+        return lon, np.full_like(lon, lat)
+
+    lms = [Landmass("A", "Isles A", 10.0, [circle_ring(*east(50.0), 2.0)]),
+           Landmass("B", "Isles B", 10.0, [circle_ring(*east(120.0), 2.0)])]
+    raster = SightingRaster.build(lms, SightingRule("u20", mode="uniform", radius_km=20.0), BOUNDS,
+                                  res_deg=0.02, cap_km=100.0)
+    detector = LandfallDetector(lms, [raster])
+    # 0-3 sail 0 -> 150 km from nowhere: no destinations given, both, B only, neither.
+    # 4-6 sail 40 -> 150 km from home A (inside its zone): a return leg not yet armed, the same
+    # armed, and an onward voyage that may land anywhere but has not left home's sight yet.
+    # 7 is a return leg sailing 100 -> 140 km, within sight of B all the way.
+    start = np.array([0.0] * 4 + [40.0] * 3 + [100.0])
+    lon0, lat0 = east(start)
+    lon1, lat1 = east(np.array([150.0] * 7 + [140.0]))
+    eligible = np.array([[True, True], [True, True], [False, True], [False, False],
+                         [True, False], [True, False], [True, True], [True, False]])
+    origin = np.array([-1] * 4 + [0] * 4)
+    armed = np.array([True] * 4 + [False, True, False, False])
+    hit, frac, landmass, armed_new = detector.check_segment(lon0, lat0, lon1, lat1, origin, armed,
+                                                            np.ones(8, bool), eligible=eligible)
+    full = detector.check_segment(lon0[:1], lat0[:1], lon1[:1], lat1[:1], [-1], [True], [True])
+    for a, b in zip(full, (hit[:, :1], frac[:, :1], landmass[:, :1], armed_new[:, :1])):
+        np.testing.assert_array_equal(a, b)   # all groups eligible is the same as no mask
+
+    np.testing.assert_array_equal(hit[0], [True, True, True, False, False, True, True, False])
+    np.testing.assert_array_equal(landmass[0], [0, 0, 1, -1, -1, 0, 1, -1])
+    sighted_at = start + frac[0] * (150.0 - start)
+    np.testing.assert_allclose(sighted_at[[0, 1, 2, 6]], [28.0, 28.0, 98.0, 98.0], atol=1.0)
+    assert frac[0, 5] == 0.0   # armed: home counts from the start
+    # Land that does not count is still land: in sight of B throughout, voyage 7 is not armed.
+    np.testing.assert_array_equal(armed_new[0], [True] * 7 + [False])
+    with pytest.raises(ValueError, match="eligible"):
+        detector.check_segment(lon0, lat0, lon1, lat1, origin, armed, np.ones(8, bool), eligible=eligible[:, :1])
+
+
+def test_eligible_land_is_hidden_where_ineligible_land_has_the_smaller_margin():
+    # The documented limitation: islands 30 km apart with 21 km zones overlapping between 9 and 21 km
+    # east of the first. The raster names the nearer one, so the eligible second island comes into
+    # sight only past the midpoint, not 9 km east of the first.
+    near = (-147.0, -17.0)
+    far = offset(*near, 30.0, 0.0)
+    lms = [Landmass("Near", "Other", 10.0, [circle_ring(*near, 1.0)]),
+           Landmass("Far", "Dest", 10.0, [circle_ring(*far, 1.0)])]
+    raster = SightingRaster.build(lms, SightingRule("u20", mode="uniform", radius_km=20.0), BOUNDS,
+                                  res_deg=0.02, cap_km=100.0)
+    detector = LandfallDetector(lms, [raster])
+    lon0, lat0 = offset(*near, -40.0, 0.0)
+    lon1, lat1 = offset(*near, 60.0, 0.0)
+    hit, frac, landmass, _ = detector.check_segment([lon0], [lat0], [lon1], [lat1], [-1], [True], [True],
+                                                    eligible=[[False, True]])
+    assert hit[0, 0] and landmass[0, 0] == 1
+    assert 13.5 < -40.0 + 100.0 * frac[0, 0] < 17.0
+
+
+def test_rules_select_and_order_rasters(atoll_rasters):
+    detector = LandfallDetector([atoll()], [atoll_rasters[name] for name in ("u20", "u26", "u60")])
+    # Straight at the atoll from 100 km off its rim to 10 km off, and the same 150 km north of it.
+    north = np.array([0.0, 150.0])
+    lon0, lat0 = offset(ATOLL_LON, ATOLL_LAT, np.full(2, ATOLL_R + 100.0), north)
+    lon1, lat1 = offset(ATOLL_LON, ATOLL_LAT, np.full(2, ATOLL_R + 10.0), north)
+    every = detector.check_segment(lon0, lat0, lon1, lat1, [-1, -1], np.zeros(2, bool), np.ones(2, bool))
+    # Per-rule armed and active rows follow the order of ``rules``.
+    armed = np.array([[False, True], [True, False]])
+    active = np.array([[True, True], [True, False]])
+    some = detector.check_segment(lon0, lat0, lon1, lat1, [-1, -1], armed, active, rules=[2, 0])
+    assert [a.shape for a in some] == [(2, 2)] * 4
+    for a, b in zip(every[:3], some[:3]):
+        np.testing.assert_array_equal(a[[2, 0]][active], b[active])
+    np.testing.assert_array_equal(some[3], (every[3][[2, 0]] & active) | armed)
+    assert some[0][:, 0].all() and some[1][0, 0] < some[1][1, 0] and not some[0][1, 1]
 
 
 def test_arming_is_per_rule(atoll_rasters):

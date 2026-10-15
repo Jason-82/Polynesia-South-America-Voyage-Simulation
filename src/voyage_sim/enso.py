@@ -1,16 +1,29 @@
 """ENSO climate-state labels for launch dates.
 
 The grid reports success odds separately for El Nino, La Nina and neutral
-years. The labels come from the Oceanic Nino Index (ONI): the 3-month running
-mean of Nino 3.4 sea-surface temperature anomalies. NOAA's rule makes a month
-part of an El Nino (La Nina) episode when it belongs to a run of at least five
-consecutive overlapping 3-month seasons with ONI >= +0.5 (<= -0.5) degC.
+launches. The main labels come from NOAA's Relative Oceanic Nino Index (RONI),
+repeated with the older Oceanic Nino Index (ONI): both are 3-month running means
+of Nino 3.4 sea-surface temperature anomalies, RONI with the tropical-wide mean
+removed. NOAA's rule makes a month part of an El Nino (La Nina) episode when it
+belongs to a run of at least five consecutive overlapping 3-month seasons with
+the index >= +0.5 (<= -0.5) degC.
 
-Two NOAA text formats are read: CPC's ``oni.ascii.txt`` (ONI by season) and
-PSL's year-plus-twelve-values format (any monthly index; a raw Nino 3.4 anomaly
-series becomes ONI-like through ``running_mean_3``). Every series is indexed by
-calendar month as a monthly ``pd.PeriodIndex``; a 3-month season is filed under
-its centre month (DJF 1950 -> 1950-01, NDJ 1950 -> 1950-12).
+Both indices start in 1950. For the 1940s, PSL's HadISST Nino 3.4 anomaly is
+re-centred on 1991-2020 (``recentre``), averaged over 3 months
+(``running_mean_3``) and put through the same rule; those labels come from a
+different index and are flagged as such by the caller.
+
+Two NOAA text formats are read: CPC's seasonal files (``oni.ascii.txt``,
+``RONI.ascii.txt``) and PSL's year-plus-twelve-values format. Every series is
+indexed by calendar month as a monthly ``pd.PeriodIndex``; a 3-month season is
+filed under its centre month (DJF 1950 -> 1950-01, NDJ 1950 -> 1950-12).
+A launch takes the label and index value of its calendar month (UTC), so an
+April launch takes the MAM season.
+
+Bootstrap intervals resample July-June years (``enso_year``): an event usually
+grows through the northern summer, peaks around December and decays by the
+next spring, so a July-June year keeps an event's launches in one cluster
+where a calendar year would split them.
 """
 
 from __future__ import annotations
@@ -49,18 +62,25 @@ def _monthly(series: pd.Series) -> pd.Series:
     return s.reindex(full).astype(float)
 
 
-def parse_cpc_oni(text: str) -> pd.Series:
-    """CPC ``oni.ascii.txt`` -> ONI anomaly (degC) indexed by each season's centre month."""
+def parse_cpc_seasonal(text: str) -> pd.Series:
+    """CPC seasonal index text -> anomaly (degC) indexed by each season's centre month.
+
+    Reads ``oni.ascii.txt`` (``SEAS YR TOTAL ANOM``) and ``RONI.ascii.txt``
+    (``SEAS YR ANOM``) alike: the anomaly is the last column.
+    """
     months, values = [], []
     for line in text.splitlines():
         parts = line.split()
-        if len(parts) < 4 or parts[0].upper() not in _SEASON_CENTRE:
+        if len(parts) < 3 or parts[0].upper() not in _SEASON_CENTRE:
             continue  # header or blank line
-        anom = float(parts[3])
+        anom = float(parts[-1])
         months.append(pd.Period(year=int(parts[1]), month=_SEASON_CENTRE[parts[0].upper()], freq="M"))
         values.append(np.nan if anom <= _CPC_MISSING else anom)
-    s = pd.Series(values, index=pd.PeriodIndex(months, freq="M", name="month"), dtype=float, name="oni")
+    s = pd.Series(values, index=pd.PeriodIndex(months, freq="M", name="month"), dtype=float, name="anom")
     return s.sort_index()
+
+
+parse_cpc_oni = parse_cpc_seasonal
 
 
 def parse_psl_monthly(text: str) -> pd.Series:
@@ -85,6 +105,23 @@ def parse_psl_monthly(text: str) -> pd.Series:
     return pd.Series(values, index=index)
 
 
+def recentre(series: pd.Series, base: tuple[int, int] = (1991, 2020)) -> pd.Series:
+    """Monthly anomalies re-expressed against the ``base`` years (inclusive).
+
+    Each calendar month loses its mean over the base years, so the series
+    becomes an anomaly from the 1991-2020 climatology whatever base period it
+    was published on. Every calendar month needs a value in the base years.
+    """
+    s = _monthly(series)
+    months = s.index.month
+    in_base = (s.index.year >= base[0]) & (s.index.year <= base[1])
+    clim = s[in_base].groupby(months[in_base]).mean()
+    missing = sorted(set(range(1, 13)) - set(clim.dropna().index))
+    if missing:
+        raise ValueError(f"no {base[0]}-{base[1]} values for calendar months {missing}")
+    return s - clim.reindex(months).to_numpy()
+
+
 def running_mean_3(series: pd.Series) -> pd.Series:
     """Centred 3-month mean over consecutive calendar months; NaN unless all three exist."""
     return _monthly(series).rolling(3, center=True, min_periods=3).mean()
@@ -99,12 +136,12 @@ def _in_long_run(mask: np.ndarray, min_run: int) -> np.ndarray:
 
 
 def enso_phases(oni: pd.Series, threshold: float = 0.5, min_run: int = 5) -> pd.Series:
-    """NOAA episode rule on ONI values (already 3-month means): one phase label per month.
+    """NOAA episode rule on index values (already 3-month means): one phase label per month.
 
     Months are El Nino (La Nina) inside runs of at least ``min_run`` consecutive
-    months with ONI >= +threshold (<= -threshold), neutral otherwise. A missing
-    month breaks a run; months without an ONI value are left out of the result,
-    so ``label_times`` reports them as unknown.
+    months with the index >= +threshold (<= -threshold), neutral otherwise. A
+    missing month breaks a run; months without a value are left out of the
+    result, so ``label_times`` reports them as unknown.
     """
     s = _monthly(oni)
     x = s.to_numpy()
@@ -116,20 +153,39 @@ def enso_phases(oni: pd.Series, threshold: float = 0.5, min_run: int = 5) -> pd.
     return out[np.isfinite(x)]
 
 
-def label_times(t_hours, phases: pd.Series) -> np.ndarray:
-    """Phase of the calendar month (UTC) of each epoch-hour time; ``"unknown"`` where unlabelled."""
+def _at_months(t_hours, series: pd.Series, fill, dtype) -> np.ndarray:
+    """Value of ``series`` (monthly, or timestamped) at the UTC calendar month of each time; ``fill`` where absent."""
     t = np.atleast_1d(np.asarray(t_hours, dtype=float))
     finite = np.isfinite(t)
     months = geo.from_epoch_hours(np.where(finite, t, 0.0)).astype("datetime64[M]").astype(np.int64)
-    p = phases.dropna()
-    if not isinstance(p.index, pd.PeriodIndex):
-        p.index = pd.DatetimeIndex(p.index).to_period("M")
-    p = p.sort_index()
-    known = p.index.asfreq("M").asi8  # monthly period ordinals count months from 1970-01
-    out = np.full(t.shape, UNKNOWN, dtype=object)
+    s = series.dropna()
+    if not isinstance(s.index, pd.PeriodIndex):
+        s.index = pd.DatetimeIndex(s.index).to_period("M")
+    s = s.sort_index()
+    known = s.index.asfreq("M").asi8  # monthly period ordinals count months from 1970-01
+    out = np.full(t.shape, fill, dtype=dtype)
     if len(known) == 0:
         return out
     pos = np.clip(np.searchsorted(known, months), 0, len(known) - 1)
     found = finite & (known[pos] == months)
-    out[found] = p.to_numpy(dtype=object)[pos[found]]
+    out[found] = s.to_numpy(dtype=dtype)[pos[found]]
     return out
+
+
+def label_times(t_hours, phases: pd.Series) -> np.ndarray:
+    """Phase of the calendar month (UTC) of each epoch-hour time; ``"unknown"`` where unlabelled."""
+    return _at_months(t_hours, phases, UNKNOWN, object)
+
+
+def index_at_times(t_hours, index: pd.Series) -> np.ndarray:
+    """Index value of the calendar month (UTC) of each epoch-hour time; NaN where the index has none."""
+    return _at_months(t_hours, index, np.nan, np.float64)
+
+
+def enso_year(t_hours) -> np.ndarray:
+    """July-June year of each epoch-hour time, named by its July (Jul 1997 - Jun 1998 -> 1997)."""
+    t = np.atleast_1d(np.asarray(t_hours, dtype=float))
+    if not np.all(np.isfinite(t)):
+        raise ValueError("enso_year needs finite times")
+    months = geo.from_epoch_hours(t).astype("datetime64[M]").astype(np.int64)  # months since 1970-01
+    return (months - 6) // 12 + 1970

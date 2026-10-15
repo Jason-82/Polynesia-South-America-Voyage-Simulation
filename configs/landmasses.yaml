@@ -1,0 +1,462 @@
+# The land in the study domain: island groups, coast segments, regions and
+# sighting heights. Read by voyage_sim.catalog.build_catalog(), which builds
+# the shorelines from GSHHG 2.3.7 (full resolution, level 1) when downloaded,
+# and otherwise a placeholder (named islands as circles, the coast from a
+# coarse polyline) for synthetic runs and tests.
+#
+# Coordinates are [lon, lat] in degrees (lon east, lat north). Heights are the
+# effective sighting height in m: the highest point, counting the trees on
+# atolls. Distances are km.
+#
+# Schema
+# ------
+# domain: [lon_min, lon_max, lat_min, lat_max]   # polygons whose centroid lies outside are dropped
+# merge_km: 3          # polygons of one pool whose shorelines come this close merge into one landmass
+#                      # (the motu of an atoll); a group may override it (default 3)
+# match_km: 20         # a named island matches the landmass containing its ref, else the nearest
+#                      # within this distance; failing that, its placeholder circle is used (default 20)
+# continent_min_area_km2: 1.0e+6  # GSHHG polygons at least this large are continents (default 1e6)
+# drop_ids: [56711]   # GSHHG polygons (the shapefile's id field) to leave out (default none)
+# pacific_mask: [[lon, lat], ...] # polygon (closed automatically): continental shoreline inside it is the
+#                      # Pacific coast; islands outside it and outside every group box are dropped
+#
+# groups:              # ocean island groups; a polygon belongs to the first group whose box holds its centroid
+#   - name: South Marquesas
+#     region: polynesia          # polynesia | americas | americas_other | offshore | other
+#     kind: island               # island | atoll: kind of the group's unnamed landmasses (default island)
+#     height_m: 50               # height of the group's unnamed landmasses
+#     source: "..."              # citation or reasoning for that default
+#     merge_km: 1.0              # optional override of merge_km
+#     boxes: [[lon_min, lon_max, lat_min, lat_max], ...]
+#     islands:                   # named islands
+#       - name: Fatu Hiva
+#         ref: [lon, lat]        # reference position: the island's land centroid unless ref_type: peak
+#         ref_type: centroid     # centroid | peak (default centroid; a peak cannot be shifted to)
+#         height_m: 960
+#         radius_km: 6           # placeholder circle (no GSHHG, or no polygon matched)
+#         kind: island           # optional, default the group's kind (high islands of atoll groups say island)
+#         shift_to_ref: false    # move the matched shoreline so its centroid sits on ref (default false)
+#         source: "..."
+#
+# coast:
+#   piece_deg: 0.1               # latitude band of one coast piece (default 0.1)
+#   relief_csv: coast_relief.csv # per-band relief, relative to this file; rows are piece_deg bands
+#   relief_column: max5          # which column is the piece height (default max5: highest within 5 km)
+#   relief_source: "..."
+#   islet_drop_km: 15            # an island lying wholly this close to the continental coast is dropped
+#   island_join_km: 150          # other islands with a shoreline point this close join the coast segment
+#                                # at their centroid's latitude; farther ones are dropped (default 150)
+#   island_height_m: 50          # height of unnamed coastal islands (default 50)
+#   island_source: "..."
+#   segments:                    # north to south, not overlapping; pieces between segments are dropped
+#     - {name: "Coast: Ecuador", region: americas, north: 1.43, south: -3.39,
+#        height_m: 230, source: "..."}   # height_m: for bands without relief data (optional if none lack it)
+#   islands: [...]               # named coastal islands, as in groups (their group is the segment)
+#   placeholder: [[[lon, lat], ...], ...]   # coast polylines used without GSHHG
+#
+# Values marked "approximate, to verify" are best knowledge, not checked
+# against a DEM or a primary source; PROVISIONAL values await data.
+#
+# Reference positions marked (fact-check) are land centroids from the
+# Copernicus DEM. build_catalog() reports each named island's offset from its
+# GSHHG 2.3.7 shoreline in Catalog.named; islands whose GSHHG shoreline is
+# displaced by more than 1 km as a whole (centroid and extent agree) carry
+# shift_to_ref, with the offset found noted beside them. Offsets of 1-2 km
+# that come from a different outline rather than a displacement (Mangareva,
+# Maui, the atolls, the approximate references) are left alone.
+
+domain: [-165.0, -65.0, -50.0, 30.0]
+merge_km: 3.0
+match_km: 20.0
+continent_min_area_km2: 1.0e+6
+
+# GSHHG holds a few islands twice, once from WVS and once from WDBII (CIA World
+# Data Bank II), at different places. The Copernicus DEM has no land under the
+# copies dropped here, which would otherwise be phantom islets.
+drop_ids:
+  - 56711   # Sala y Gómez (WVS, 0.2 km2), 19 km WNW of the island; the WDBII copy, 10 km W, is kept and shifted
+  - 13983   # San Félix (WDBII), 4 km N of the island
+  - 12999   # Santa Clara (WDBII), 5 km W of the WVS copy, which lies where the DEM has the island
+
+# Roughly the continental divide of the Americas from 31N to 51S, closed far out
+# in the Pacific. Its course only matters where Pacific and Atlantic shores are
+# close: across Mexico, Central America (GSHHG splits the Americas along the
+# Panama Canal, so the mask crosses the isthmus at the canal's Pacific
+# entrance) and NW Colombia (the Gulf of Urabá is Caribbean).
+pacific_mask:
+  - [-170.0, 31.0]
+  - [-108.0, 31.0]
+  - [-104.0, 26.0]
+  - [-101.0, 21.0]
+  - [-98.5, 19.3]
+  - [-97.0, 17.8]
+  - [-95.5, 17.0]
+  - [-94.5, 16.7]
+  - [-93.2, 16.0]
+  - [-92.0, 15.4]
+  - [-90.5, 14.9]
+  - [-89.0, 14.5]
+  - [-87.5, 14.2]
+  - [-86.3, 13.4]
+  - [-85.5, 12.3]
+  - [-85.0, 11.2]
+  - [-84.5, 10.5]
+  - [-83.8, 9.9]
+  - [-83.0, 9.2]
+  - [-82.3, 8.7]
+  - [-81.0, 8.45]
+  - [-80.3, 8.75]
+  - [-79.8, 8.93]
+  - [-79.585, 8.95]
+  - [-79.4, 9.12]
+  - [-79.0, 9.3]
+  - [-78.5, 9.2]
+  - [-77.9, 8.75]
+  - [-77.35, 8.3]
+  - [-77.1, 7.6]
+  - [-76.5, 6.5]
+  - [-76.0, 3.0]
+  - [-77.0, -2.0]
+  - [-78.0, -6.0]
+  - [-75.0, -11.0]
+  - [-71.0, -15.0]
+  - [-69.0, -18.0]
+  - [-68.5, -24.0]
+  - [-69.5, -30.0]
+  - [-70.0, -35.0]
+  - [-71.0, -40.0]
+  - [-71.5, -45.0]
+  - [-71.5, -51.0]
+  - [-170.0, -51.0]
+
+groups:
+  # --- eastern Polynesia: the destinations of voyages from the Americas ---------
+  # Marquesas split by longitude so that Fatu Huku (9.43S, NE of Hiva Oa) stays
+  # with the southern group.
+  - name: South Marquesas
+    region: polynesia
+    height_m: 50
+    source: "PROVISIONAL conservative default for unnamed rocks and islets (Fatu Huku, Motu Nao); the bird
+      range (37 km) exceeds the visual range below ~70 m, so the value matters only to visual-only rules"
+    merge_km: 1.0
+    boxes: [[-139.36, -138.0, -10.9, -9.3]]
+    islands:
+      - {name: Fatu Hiva, ref: [-138.652, -10.485], height_m: 960, radius_km: 6.0,
+         source: "Copernicus DEM 957 m; literature up to 1,125 m"}
+      - {name: Tahuata, ref: [-139.088, -9.944], height_m: 1050, radius_km: 5.5, source: "literature (fact-check)"}
+      - {name: Hiva Oa, ref: [-139.016, -9.774], height_m: 1270, radius_km: 10.0, source: "literature (fact-check)"}
+      - {name: Mohotani, ref: [-138.827, -9.984], height_m: 520, radius_km: 3.0, source: "literature (fact-check)"}
+  - name: North Marquesas
+    region: polynesia
+    height_m: 50
+    source: "PROVISIONAL conservative default for unnamed rocks and islets"
+    merge_km: 1.0
+    boxes: [[-141.0, -139.36, -9.7, -7.5]]
+    islands:
+      - {name: Ua Pou, ref: [-140.074, -9.398], height_m: 1203, radius_km: 6.5, source: "literature (fact-check)"}
+      - {name: Ua Huka, ref: [-139.554, -8.908], height_m: 884, radius_km: 6.0, source: "Copernicus DEM (fact-check)"}
+      - {name: Nuku Hiva, ref: [-140.141, -8.866], height_m: 1224, radius_km: 11.5, source: "literature (fact-check)"}
+      - {name: Eiao, ref: [-140.688, -7.996], height_m: 577, radius_km: 5.0, source: "literature (fact-check)"}
+      - {name: Hatutu, ref: [-140.572, -7.917], height_m: 420, radius_km: 2.5, source: "literature (fact-check)"}
+  - name: Gambier
+    region: polynesia
+    height_m: 50
+    source: "PROVISIONAL default for the lagoon islands and reef motu"
+    merge_km: 1.0   # keeps Taravai (2 km off) apart from Mangareva
+    boxes: [[-135.3, -134.3, -23.5, -22.9]]
+    islands:
+      - {name: Mangareva, ref: [-134.962, -23.112], height_m: 441, radius_km: 4.0, source: "literature (fact-check)"}
+      - {name: Temoe, ref: [-134.48, -23.34], height_m: 18, radius_km: 3.0, kind: atoll,
+         source: "approximate, to verify: Tuamotu atoll canopy default; not in GSHHG, so always its circle"}
+  - name: Pitcairn Islands
+    region: polynesia
+    height_m: 30
+    source: "PROVISIONAL default; every island is named"
+    boxes: [[-131.0, -124.5, -25.3, -23.7]]
+    islands:
+      # GSHHG offsets: Pitcairn 1.7 km E, Henderson 1.7 km N, Ducie 1.8 km NW (Oeno 0.1 km).
+      - {name: Pitcairn, ref: [-130.106, -25.070], height_m: 347, radius_km: 2.0, shift_to_ref: true,
+         source: "literature (fact-check)"}
+      - {name: Henderson, ref: [-128.323, -24.377], height_m: 33, radius_km: 5.0, shift_to_ref: true,
+         source: "literature 33 m (fact-check); forest canopy to ~40 m"}
+      - {name: Oeno, ref: [-130.744, -23.929], height_m: 17, radius_km: 2.5, kind: atoll,
+         source: "Copernicus DEM (fact-check)"}
+      - {name: Ducie, ref: [-124.782, -24.681], height_m: 8, radius_km: 2.0, kind: atoll, shift_to_ref: true,
+         source: "Copernicus DEM (fact-check)"}
+  - name: Rapa Nui
+    region: polynesia
+    height_m: 50
+    source: "PROVISIONAL default for the offshore motu"
+    boxes: [[-109.6, -109.1, -27.3, -26.9]]
+    islands:
+      - {name: Rapa Nui, ref: [-109.355, -27.119], height_m: 507, radius_km: 9.0, source: "literature (fact-check)"}
+  # Listed before the Tuamotus, whose box overlaps theirs.
+  - name: Society Islands
+    region: polynesia
+    kind: atoll
+    height_m: 18
+    source: "Tuamotu atoll canopy (Copernicus DSM 15-21 m); the unnamed Society landmasses are atolls and motu"
+    boxes: [[-155.0, -149.3, -18.2, -15.6], [-149.3, -147.9, -18.1, -17.3]]
+    islands:
+      - {name: Tahiti, ref: [-149.401, -17.677], height_m: 2241, radius_km: 19.0, kind: island,
+         source: "literature (fact-check)"}
+      - {name: Moorea, ref: [-149.83, -17.535], height_m: 1207, radius_km: 7.5, kind: island,
+         source: "approximate, to verify"}
+      - {name: Mehetia, ref: [-148.067, -17.877], height_m: 435, radius_km: 1.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Huahine, ref: [-151.0, -16.75], height_m: 669, radius_km: 7.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Raiatea, ref: [-151.44, -16.83], height_m: 1017, radius_km: 9.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Tahaa, ref: [-151.5, -16.62], height_m: 590, radius_km: 6.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Bora Bora, ref: [-151.74, -16.50], height_m: 727, radius_km: 5.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Maupiti, ref: [-152.25, -16.45], height_m: 380, radius_km: 4.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Maiao, ref: [-150.633, -17.650], height_m: 154, radius_km: 1.7, kind: island,
+         source: "approximate, to verify"}
+  - name: Austral Islands
+    region: polynesia
+    kind: atoll
+    height_m: 18
+    source: "atoll canopy default; the high islands are named"
+    boxes: [[-155.0, -143.3, -28.2, -20.0]]
+    islands:
+      - {name: Rimatara, ref: [-152.81, -22.65], height_m: 83, radius_km: 2.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Rurutu, ref: [-151.35, -22.46], height_m: 389, radius_km: 4.5, kind: island,
+         source: "approximate, to verify"}
+      - {name: Tubuai, ref: [-149.47, -23.37], height_m: 422, radius_km: 5.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Raivavae, ref: [-147.658, -23.869], height_m: 437, radius_km: 4.0, kind: island,
+         source: "literature (fact-check)"}
+      - {name: Rapa Iti, ref: [-144.344, -27.606], height_m: 650, radius_km: 4.5, kind: island,
+         source: "literature (fact-check)"}
+      - {name: Marotiri, ref: [-143.52, -27.92], height_m: 105, radius_km: 0.5, kind: island,
+         source: "approximate, to verify"}
+  - name: Tuamotus
+    region: polynesia
+    kind: atoll
+    height_m: 18
+    source: "Copernicus DSM canopy height of Tuamotu atolls, 15-21 m measured (fact-check)"
+    merge_km: 5.0   # passes between motu reach 3-5 km (Raroia); neighbouring atolls are 8 km or more apart
+    boxes: [[-149.0, -134.6, -23.4, -14.0]]
+    islands:
+      - {name: Mataiva, ref: [-148.675, -14.885], height_m: 21, radius_km: 5.0, source: "Copernicus DSM (fact-check)"}
+      - {name: Takaroa, ref: [-144.958, -14.442], height_m: 20, radius_km: 9.0, source: "Copernicus DSM (fact-check)"}
+      - {name: Raroia, ref: [-142.43, -16.07], height_m: 18, radius_km: 14.0, source: "Copernicus DSM (fact-check)"}
+      - {name: Angatau, ref: [-140.866, -15.822], height_m: 21, radius_km: 4.0, source: "Copernicus DSM (fact-check)"}
+      - {name: Puka-Puka, ref: [-138.818, -14.820], height_m: 16, radius_km: 3.5, source: "Copernicus DSM (fact-check)"}
+      - {name: Pukarua, ref: [-137.022, -18.313], height_m: 20, radius_km: 6.0, source: "Copernicus DSM (fact-check)"}
+      - {name: Reao, ref: [-136.384, -18.515], height_m: 18, radius_km: 10.0, source: "Copernicus DSM (fact-check)"}
+      - {name: Makatea, ref: [-148.256, -15.844], height_m: 108, radius_km: 4.0, kind: island,
+         source: "raised atoll; Copernicus DEM 108 m (fact-check)"}
+
+  # --- offshore islands of the Americas: recorded, never a destination ---------
+  - name: Sala y Gómez
+    region: offshore
+    height_m: 30
+    source: "unverified, low"
+    boxes: [[-105.8, -104.9, -26.8, -26.1]]
+    islands:
+      # GSHHG puts it 10.4 km W of the reference (Natural Earth errs similarly), and a second copy 19 km
+      # WNW (dropped: drop_ids).
+      - {name: Sala y Gómez, ref: [-105.362, -26.472], height_m: 30, radius_km: 0.5, shift_to_ref: true,
+         source: "unverified, low (fact-check); Copernicus DEM shows the island but not its height"}
+  - name: Galápagos
+    region: offshore
+    height_m: 50
+    source: "PROVISIONAL conservative default for islets"
+    merge_km: 1.0
+    boxes: [[-92.3, -88.9, -1.7, 1.9]]
+    islands:
+      - {name: Isabela, ref: [-91.335, 0.042], ref_type: peak, height_m: 1707, radius_km: 30.0,
+         source: "Wolf volcano, the archipelago's highest point (fact-check); ref is the summit"}
+      - {name: Fernandina, ref: [-91.55, -0.37], height_m: 1476, radius_km: 13.0, source: "approximate, to verify"}
+      - {name: Santiago, ref: [-90.77, -0.25], height_m: 907, radius_km: 13.5, source: "approximate, to verify"}
+      - {name: Santa Cruz, ref: [-90.35, -0.63], height_m: 864, radius_km: 17.0, source: "approximate, to verify"}
+      - {name: San Cristóbal, ref: [-89.45, -0.85], height_m: 730, radius_km: 13.0, source: "approximate, to verify"}
+      - {name: Floreana, ref: [-90.43, -1.29], height_m: 640, radius_km: 7.5, source: "approximate, to verify"}
+      - {name: Española, ref: [-89.68, -1.38], height_m: 206, radius_km: 6.0, source: "approximate, to verify"}
+      - {name: Pinta, ref: [-90.75, 0.58], height_m: 777, radius_km: 6.0, source: "approximate, to verify"}
+      - {name: Marchena, ref: [-90.47, 0.33], height_m: 343, radius_km: 6.5, source: "approximate, to verify"}
+      - {name: Genovesa, ref: [-89.96, 0.32], height_m: 76, radius_km: 3.0, source: "approximate, to verify"}
+      - {name: Wolf, ref: [-91.82, 1.38], height_m: 253, radius_km: 1.0, source: "approximate, to verify"}
+      - {name: Darwin, ref: [-92.0, 1.68], height_m: 168, radius_km: 1.0, source: "approximate, to verify"}
+  - name: Cocos
+    region: offshore
+    height_m: 50
+    source: "PROVISIONAL default for islets"
+    boxes: [[-87.3, -86.8, 5.3, 5.8]]
+    islands:
+      - {name: Cocos, ref: [-87.062, 5.529], height_m: 575, radius_km: 3.5, source: "Copernicus DEM (fact-check)"}
+  - name: Malpelo
+    region: offshore
+    height_m: 50
+    source: "PROVISIONAL default for islets"
+    boxes: [[-81.8, -81.4, 3.8, 4.2]]
+    islands:
+      # GSHHG offset 2.3 km SE.
+      - {name: Malpelo, ref: [-81.608, 4.003], height_m: 300, radius_km: 1.0, shift_to_ref: true,
+         source: "literature, unverified (fact-check); Copernicus DEM 164 m"}
+  - name: Desventuradas
+    region: offshore
+    height_m: 50
+    source: "PROVISIONAL default for islets"
+    boxes: [[-80.3, -79.7, -26.5, -26.1]]
+    islands:
+      # GSHHG offsets: San Félix 1.5 km E, San Ambrosio 2.2 km E (San Félix's phantom WDBII copy dropped).
+      - {name: San Félix, ref: [-80.098, -26.292], height_m: 183, radius_km: 1.5, shift_to_ref: true,
+         source: "literature (fact-check)"}
+      - {name: San Ambrosio, ref: [-79.890, -26.343], height_m: 455, radius_km: 1.5, shift_to_ref: true,
+         source: "literature (fact-check)"}
+  - name: Juan Fernández
+    region: offshore
+    height_m: 50
+    source: "PROVISIONAL default for islets"
+    boxes: [[-81.0, -78.6, -33.9, -33.5]]
+    islands:
+      # Santa Clara, 1-1.5 km off, merges with Robinson Crusoe, as it does in the DEM land centroid used as
+      # the reference (its phantom WDBII copy is dropped). GSHHG offsets: Robinson Crusoe 1.1 km NNW,
+      # Alejandro Selkirk 4.2 km NE.
+      - {name: Robinson Crusoe, ref: [-78.847, -33.647], height_m: 915, radius_km: 5.5, shift_to_ref: true,
+         source: "literature (fact-check)"}
+      - {name: Alejandro Selkirk, ref: [-80.792, -33.767], height_m: 1360, radius_km: 5.0, shift_to_ref: true,
+         source: "literature (fact-check)"}
+  - name: Clipperton
+    region: offshore
+    kind: atoll
+    height_m: 29
+    source: "Clipperton Rock (fact-check)"
+    boxes: [[-109.4, -109.0, 10.1, 10.5]]
+    islands:
+      - {name: Clipperton, ref: [-109.218, 10.304], height_m: 29, radius_km: 2.0, kind: atoll,
+         source: "Clipperton Rock 29 m (fact-check)"}
+  - name: Revillagigedo
+    region: offshore
+    height_m: 50
+    source: "PROVISIONAL default for islets"
+    boxes: [[-115.0, -110.0, 18.0, 19.6]]
+    islands:
+      - {name: Socorro, ref: [-110.97, 18.78], height_m: 1050, radius_km: 7.0, source: "approximate, to verify"}
+      - {name: Clarión, ref: [-114.73, 18.36], height_m: 335, radius_km: 3.0, source: "approximate, to verify"}
+      - {name: San Benedicto, ref: [-110.81, 19.31], height_m: 310, radius_km: 2.0, source: "approximate, to verify"}
+      - {name: Roca Partida, ref: [-112.07, 18.99], height_m: 34, radius_km: 0.5,
+         source: "approximate, to verify; too small for GSHHG, so always its circle"}
+  - name: Guadalupe
+    region: offshore
+    height_m: 50
+    source: "PROVISIONAL default for islets"
+    merge_km: 1.0
+    boxes: [[-118.6, -118.0, 28.7, 29.4]]
+    islands:
+      - {name: Guadalupe, ref: [-118.29, 29.03], height_m: 1298, radius_km: 9.0, source: "approximate, to verify"}
+  - name: Alijos
+    region: offshore
+    height_m: 34
+    source: "approximate, to verify: Alijos Rocks, the highest about 34 m"
+    boxes: [[-115.9, -115.6, 24.8, 25.1]]
+    islands:
+      - {name: Alijos Rocks, ref: [-115.75, 24.95], height_m: 34, radius_km: 0.5, source: "approximate, to verify"}
+
+  # --- elsewhere: validation voyages and the domain's edges ----------------------
+  # Listed before the Line Islands, whose box overlaps theirs.
+  - name: Cook Islands
+    region: other
+    kind: atoll
+    height_m: 18
+    source: "atoll canopy default; the high and raised islands are named"
+    boxes: [[-165.0, -157.0, -22.5, -8.5]]
+    islands:
+      - {name: Rarotonga, ref: [-159.78, -21.23], height_m: 652, radius_km: 5.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Mangaia, ref: [-157.93, -21.92], height_m: 169, radius_km: 5.5, kind: island,
+         source: "approximate, to verify"}
+      - {name: Atiu, ref: [-158.12, -20.00], height_m: 72, radius_km: 4.0, kind: island,
+         source: "approximate, to verify"}
+      - {name: Aitutaki, ref: [-159.78, -18.86], height_m: 124, radius_km: 6.0, kind: island,
+         source: "approximate, to verify"}
+  - name: Line Islands
+    region: other
+    kind: atoll
+    height_m: 18
+    source: "atoll canopy default (Malden, Jarvis and Starbuck are treeless and lower)"
+    boxes: [[-163.0, -149.5, -12.0, 7.0]]
+    islands:
+      - {name: Kiritimati, ref: [-157.40, 1.87], height_m: 18, radius_km: 20.0, source: "approximate, to verify"}
+  - name: Hawaiian Islands
+    region: other
+    height_m: 50
+    source: "PROVISIONAL conservative default for islets"
+    merge_km: 1.0
+    boxes: [[-165.0, -154.0, 18.5, 24.0]]
+    islands:
+      - {name: Hawaiʻi, ref: [-155.518, 19.598], height_m: 4205, radius_km: 60.0, source: "Mauna Kea (fact-check)"}
+      - {name: Maui, ref: [-156.344, 20.785], height_m: 3055, radius_km: 25.0,
+         source: "Haleakalā at 20.710N 156.253W (fact-check); ref is the land centroid"}
+      - {name: Kahoʻolawe, ref: [-156.61, 20.55], height_m: 450, radius_km: 6.5, source: "approximate, to verify"}
+      - {name: Lānaʻi, ref: [-156.93, 20.83], height_m: 1026, radius_km: 9.0, source: "approximate, to verify"}
+      - {name: Molokaʻi, ref: [-157.0, 21.13], height_m: 1512, radius_km: 15.0, source: "approximate, to verify"}
+      - {name: Oʻahu, ref: [-157.975, 21.461], height_m: 1225, radius_km: 22.0, source: "literature (fact-check)"}
+      - {name: Kauaʻi, ref: [-159.53, 22.06], height_m: 1598, radius_km: 21.0, source: "approximate, to verify"}
+      - {name: Niʻihau, ref: [-160.16, 21.90], height_m: 390, radius_km: 8.0, source: "approximate, to verify"}
+      - {name: Nihoa, ref: [-161.92, 23.06], height_m: 273, radius_km: 0.5, source: "approximate, to verify"}
+      - {name: Necker, ref: [-164.70, 23.58], height_m: 84, radius_km: 0.5, source: "approximate, to verify"}
+
+coast:
+  piece_deg: 0.1
+  relief_csv: coast_relief.csv
+  relief_column: max5
+  relief_source: "Copernicus GLO-90 DSM: highest mainland point within 5 km of the Pacific shore in the band
+    (configs/coast_relief.csv)"
+  islet_drop_km: 15.0
+  island_join_km: 150.0
+  island_height_m: 50
+  island_source: "PROVISIONAL conservative default for unnamed coastal islands; the bird range (37 km) exceeds
+    the visual range below ~70 m"
+  segments:
+    - {name: "Coast: Central America", region: americas_other, north: 30.0, south: 7.2, height_m: 150,
+       source: "PROVISIONAL: no relief data north of 7.2N; conservative guess for the Pacific coast of Mexico
+         and Central America"}
+    - {name: "Coast: Colombia", region: americas, north: 7.2, south: 1.43}
+    - {name: "Coast: Ecuador", region: americas, north: 1.43, south: -3.39}
+    - {name: "Coast: Northern Peru", region: americas, north: -3.39, south: -8.0}
+    - {name: "Coast: Southern Peru", region: americas, north: -8.0, south: -18.35}
+    - {name: "Coast: Northern Chile", region: americas, north: -18.35, south: -26.0}
+    - {name: "Coast: Central Chile", region: americas, north: -26.0, south: -42.0}
+    - {name: "Coast: Southern Chile", region: americas_other, north: -42.0, south: -50.0, height_m: 300,
+       source: "PROVISIONAL: no relief data south of 42S; conservative guess for the fjord coast"}
+  islands:
+    - {name: Coiba, ref: [-81.78, 7.45], height_m: 416, radius_km: 12.5, source: "approximate, to verify"}
+    - {name: Gorgona, ref: [-78.18, 2.97], height_m: 338, radius_km: 3.0, source: "approximate, to verify"}
+    - {name: Isla de la Plata, ref: [-81.07, -1.27], height_m: 167, radius_km: 2.0, source: "approximate, to verify"}
+    - {name: Lobos de Tierra, ref: [-80.85, -6.43], height_m: 80, radius_km: 3.0, source: "approximate, to verify"}
+    - {name: Lobos de Afuera, ref: [-80.71, -6.93], height_m: 100, radius_km: 2.0, source: "approximate, to verify"}
+    - {name: Isla Santa María, ref: [-73.53, -37.03], height_m: 80, radius_km: 4.0, source: "approximate, to verify"}
+    - {name: Isla Mocha, ref: [-73.92, -38.37], height_m: 390, radius_km: 5.0, source: "approximate, to verify"}
+    - {name: Chiloé, ref: [-73.9, -42.6], height_m: 800, radius_km: 50.0, source: "approximate, to verify"}
+  # Without GSHHG: the open Pacific coast at about 1 degree spacing, read off GSHHG (gulfs cut across:
+  # California, Panama, Guayaquil). Baja California, then the mainland from Mazatlán south.
+  placeholder:
+    - [[-115.81, 29.95], [-114.61, 29.02], [-114.24, 27.97], [-114.05, 27.03], [-112.23, 26.03], [-112.16, 24.98],
+       [-110.95, 24.03], [-109.90, 22.88]]
+    - [[-106.42, 23.18], [-105.66, 22.03], [-105.35, 20.97], [-105.70, 20.40], [-105.09, 19.53], [-104.47, 19.11],
+       [-103.47, 18.30], [-102.47, 18.00], [-101.47, 17.59], [-100.47, 17.07], [-99.47, 16.69], [-98.47, 16.28],
+       [-97.47, 15.93], [-96.50, 15.64], [-95.53, 15.96], [-95.03, 16.19], [-94.47, 16.18], [-93.47, 15.70],
+       [-92.47, 14.76], [-91.47, 14.02], [-90.47, 13.89], [-89.53, 13.49], [-88.47, 13.16], [-87.47, 12.75],
+       [-86.47, 11.74], [-85.98, 11.34], [-85.85, 10.40], [-85.47, 9.85], [-85.03, 9.68], [-84.53, 9.52],
+       [-83.97, 9.32], [-83.47, 8.44], [-82.97, 8.23], [-82.49, 8.28], [-81.97, 8.20], [-81.48, 7.70],
+       [-80.97, 7.50], [-80.53, 7.24], [-80.03, 7.45], [-78.37, 7.90], [-78.18, 7.52], [-77.97, 7.28],
+       [-77.68, 7.03], [-77.33, 6.49], [-77.35, 6.03], [-77.56, 5.48], [-77.38, 5.03], [-77.35, 4.47],
+       [-77.44, 4.03], [-77.36, 3.47], [-77.71, 2.97], [-78.46, 2.50], [-78.66, 2.00], [-78.86, 1.48],
+       [-79.67, 0.97], [-80.05, 0.48], [-80.14, -0.03], [-80.47, -0.47], [-80.88, -1.02], [-80.82, -1.51],
+       [-80.76, -1.98], [-81.00, -2.20], [-80.50, -3.53], [-81.31, -4.48], [-80.92, -5.47], [-80.43, -6.47],
+       [-79.57, -7.47], [-78.90, -8.47], [-78.41, -9.47], [-77.97, -10.49], [-77.35, -11.47], [-76.81, -12.49],
+       [-76.19, -13.49], [-75.97, -14.52], [-74.99, -15.48], [-73.09, -16.47], [-71.37, -17.47], [-70.34, -18.47],
+       [-70.22, -19.47], [-70.20, -20.53], [-70.08, -21.49], [-70.25, -22.47], [-70.63, -23.52], [-70.58, -24.53],
+       [-70.65, -25.53], [-70.71, -26.53], [-70.90, -27.51], [-71.28, -28.50], [-71.34, -29.49], [-71.70, -30.48],
+       [-71.59, -31.47], [-71.47, -32.53], [-71.66, -33.48], [-72.05, -34.53], [-72.57, -35.53], [-72.98, -36.53],
+       [-73.60, -37.53], [-73.52, -38.48], [-73.26, -39.50], [-73.77, -40.47], [-73.82, -41.47], [-72.83, -42.53],
+       [-73.09, -43.47], [-72.74, -44.47], [-73.51, -45.53], [-75.44, -46.53], [-74.55, -47.53], [-74.27, -48.53],
+       [-74.29, -49.48], [-74.35, -49.99]]

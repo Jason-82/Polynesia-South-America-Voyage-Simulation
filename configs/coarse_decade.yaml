@@ -1,0 +1,107 @@
+# Coarse grid on real data, 2010-2019 (SPEC "Experiments": debug before scaling up).
+#
+#   voyage-sim run configs/coarse_decade.yaml       (or: python -m voyage_sim run ...)
+#
+# NOT RUNNABLE until the data are downloaded (paths below, from the repository root):
+#
+#   voyage-sim fetch era5 --years 2010-2019 --out data/era5
+#   voyage-sim fetch era5 --years 2020 --months 1-6 --out data/era5
+#   voyage-sim fetch glorys --start 2010-01-01 --end 2020-06-30 --out data/glorys
+#   # block-average the 1/12 deg currents to 0.25 deg:
+#   python -c "import glob, os; from voyage_sim import fetch; [fetch.coarsen_currents(p, os.path.join('data/glorys/coarse', os.path.basename(p))) for p in sorted(glob.glob('data/glorys/glorys_uv_*.nc'))]"
+#   voyage-sim fetch gshhg --out data/gshhg
+#   voyage-sim fetch enso --out data/enso
+#
+# The last launches (December 2019) sail into 2020: the wait-for-wind canoe
+# may wait 60 days and sail 90, the raft drifts 120, so winds and currents are
+# needed to the end of May 2020. ERA5 needs a Climate Data Store account and
+# GLORYS a Copernicus Marine one (voyage_sim.fetch). Each launch month reads
+# about five months of 6-hourly winds (~0.6 GB) and 0.25 deg currents.
+#
+# Two vessels and their strategies: the upwind canoe holding course for the
+# far side, or waiting in port for a wind that lets it lay the course; and the
+# drifting raft. Departures Fatu Hiva and Pukarua sail for Manta (question 1),
+# Manta for Fatu Hiva (question 2). All SPEC sighting rules; supplies 30, 60
+# and 90 days for the canoe, also 120 for the raft; month and RONI ENSO phase.
+#
+# The config schema is documented at the top of configs/synthetic_demo.yaml.
+# Paths are relative to this file's directory.
+
+name: coarse_decade
+seed: 0
+
+environment:
+  type: files
+  wind: {paths: ../data/era5/era5_uv10_*.nc, u: u10, v: v10}
+  current: {paths: ../data/glorys/coarse/glorys_uv_*.nc, u: uo, v: vo}
+  climatology: null           # every launch is after 1993
+  wind_cap_ms: 50
+
+catalog:
+  config: landmasses.yaml
+  gshhg_dir: ../data/gshhg
+  cache_dir: ../outputs/cache
+
+rules:
+  - {name: main, mode: height, bird_km: 37}
+  - {name: uniform20, mode: uniform, radius_km: 20}
+  - {name: uniform40, mode: uniform, radius_km: 40}
+  - {name: uniform60, mode: uniform, radius_km: 60}
+  - {name: visual, mode: height}
+  - {name: main_x0.5, mode: height, bird_km: 37, scale: 0.5}
+  - {name: main_x1.5, mode: height, bird_km: 37, scale: 1.5}
+
+raster:
+  bounds: [-165, -65, -50, 30]
+  res_deg: 0.05
+  cap_km: 250
+
+vessels: vessels.yaml
+places: places.yaml
+
+launches:
+  start: 2010-01-01
+  end: 2019-12-31
+  every_days: 1
+  per_day: 4
+  hour: 0
+
+sim:
+  dt_hours: 6
+  integrator: midpoint
+  speed_sd: 0.10
+  heading_sd_deg: 10
+  diffusivity_m2s: 30
+  track_every: 4
+
+analysis:
+  supplies: [30, 60, 90, 120]
+  by: [month, enso]
+  n_boot: 2000
+  enso_index: ../data/enso/RONI.ascii.txt
+
+cells:
+  - {name: fatuhiva_canoe75_hold, departure: Fatu Hiva, target: Manta, vessel: canoe_75,
+     strategy: {name: hold_course, tack_hysteresis_deg: 15}, destinations: {regions: [americas]},
+     max_days_at_sea: 90}
+  - {name: fatuhiva_canoe75_wait, departure: Fatu Hiva, target: Manta, vessel: canoe_75,
+     strategy: {name: wait_for_wind, max_wait_days: 60}, destinations: {regions: [americas]},
+     max_days_at_sea: 90}
+  - {name: fatuhiva_raft_drift, departure: Fatu Hiva, target: null, vessel: drift_raft,
+     strategy: drift, destinations: {regions: [americas]}, max_days_at_sea: 120}
+  - {name: pukarua_canoe75_hold, departure: Pukarua, target: Manta, vessel: canoe_75,
+     strategy: {name: hold_course, tack_hysteresis_deg: 15}, destinations: {regions: [americas]},
+     max_days_at_sea: 90}
+  - {name: pukarua_canoe75_wait, departure: Pukarua, target: Manta, vessel: canoe_75,
+     strategy: {name: wait_for_wind, max_wait_days: 60}, destinations: {regions: [americas]},
+     max_days_at_sea: 90}
+  - {name: pukarua_raft_drift, departure: Pukarua, target: null, vessel: drift_raft,
+     strategy: drift, destinations: {regions: [americas]}, max_days_at_sea: 120}
+  - {name: manta_canoe75_hold, departure: Manta, target: Fatu Hiva, vessel: canoe_75,
+     strategy: {name: hold_course, tack_hysteresis_deg: 15}, destinations: {regions: [polynesia]},
+     max_days_at_sea: 90}
+  - {name: manta_canoe75_wait, departure: Manta, target: Fatu Hiva, vessel: canoe_75,
+     strategy: {name: wait_for_wind, max_wait_days: 60}, destinations: {regions: [polynesia]},
+     max_days_at_sea: 90}
+  - {name: manta_raft_drift, departure: Manta, target: null, vessel: drift_raft,
+     strategy: drift, destinations: {regions: [polynesia]}, max_days_at_sea: 120}

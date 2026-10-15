@@ -16,6 +16,15 @@ CPC_SNIPPET = """\
   FMA 1951  -99.9  -99.9
 """
 
+RONI_SNIPPET = """\
+ SEAS   YR  ANOM
+  OND 1997  2.21
+  NDJ 1997  2.19
+  DJF 1998  1.98
+  JFM 1998  1.51
+  FMA 1998 -99.90
+"""
+
 PSL_SNIPPET = """\
  1950 1951
  1950   -1.53   -1.34   -1.16   -1.18   -1.07   -0.85   -0.54   -0.42   -0.39   -0.44   -0.60   -0.80
@@ -43,6 +52,16 @@ def test_cpc_seasons_filed_under_centre_month_across_year_boundary():
     assert oni[pd.Period("1950-10", "M")] == pytest.approx(-0.81)
     assert np.isnan(oni[pd.Period("1951-03", "M")])
     assert len(oni) == 8 and oni.index.is_monotonic_increasing
+
+
+def test_roni_without_total_column_reads_the_last_column():
+    roni = enso.parse_cpc_seasonal(RONI_SNIPPET)
+    assert list(roni.index.astype(str)) == ["1997-11", "1997-12", "1998-01", "1998-02", "1998-03"]
+    np.testing.assert_allclose(roni.to_numpy(), [2.21, 2.19, 1.98, 1.51, np.nan])
+    # The ONI file's ANOM is its last column too, not TOTAL.
+    oni = enso.parse_cpc_seasonal(CPC_SNIPPET)
+    assert oni[pd.Period("1950-01", "M")] == pytest.approx(-1.53)
+    assert enso.parse_cpc_oni is enso.parse_cpc_seasonal
 
 
 def test_psl_parses_rows_missing_flag_and_ignores_footer():
@@ -144,3 +163,68 @@ def test_cpc_to_launch_labels_end_to_end():
     phases = enso.enso_phases(enso.parse_cpc_oni(text))
     t = geo.to_epoch_hours(np.array(["1997-03-10", "1997-05-01", "1997-12-20"], dtype="datetime64[s]"))
     assert list(enso.label_times(t, phases)) == ["neutral", "el_nino", "el_nino"]
+
+
+def test_index_at_times_reads_the_launch_month_value():
+    index = _months("1997-11", [2.21, 2.19, np.nan, 1.51])
+    t = geo.to_epoch_hours(
+        np.array(["1997-11-30T23:00", "1997-12-01", "1998-01-15", "1998-02-28", "1998-03-01"], dtype="datetime64[s]")
+    )
+    np.testing.assert_allclose(enso.index_at_times(np.append(t, np.nan), index),
+                               [2.21, 2.19, np.nan, 1.51, np.nan, np.nan])
+    roni = enso.parse_cpc_seasonal(RONI_SNIPPET)
+    np.testing.assert_allclose(enso.index_at_times(t[:2], roni), [2.21, 2.19])
+
+
+def test_enso_year_runs_july_to_june():
+    t = geo.to_epoch_hours(
+        np.array(
+            ["1997-06-30T23:00", "1997-07-01", "1998-06-30T23:59", "1998-07-01", "1970-01-01", "1969-07-01"],
+            dtype="datetime64[s]",
+        )
+    )
+    np.testing.assert_array_equal(enso.enso_year(t), [1996, 1997, 1997, 1998, 1969, 1969])
+    assert enso.enso_year(t).dtype == np.int64
+    with pytest.raises(ValueError):
+        enso.enso_year([0.0, np.nan])
+
+
+def test_recentre_removes_each_calendar_months_base_mean():
+    idx = pd.period_range("1940-01", "2020-12", freq="M")
+    # Anomalies on an older base: 1991-2020 runs 0.3 warm, more so in December.
+    offset = np.where(idx.year >= 1991, 0.3 + 0.2 * (idx.month == 12), 0.0)
+    wiggle = 0.1 * np.sin(np.arange(len(idx)))
+    s = pd.Series(offset + wiggle, index=idx)
+    out = enso.recentre(s)
+    base = out[(out.index.year >= 1991)]
+    np.testing.assert_allclose(base.groupby(base.index.month).mean(), 0.0, atol=1e-12)
+    # Outside the base the shift is the base mean of the calendar month.
+    jan41, dec41 = pd.Period("1941-01", "M"), pd.Period("1941-12", "M")
+    jan_mean = s[(idx.year >= 1991) & (idx.month == 1)].mean()
+    dec_mean = s[(idx.year >= 1991) & (idx.month == 12)].mean()
+    assert out[jan41] == pytest.approx(s[jan41] - jan_mean)
+    assert out[dec41] == pytest.approx(s[dec41] - dec_mean)
+    with pytest.raises(ValueError, match="calendar months"):
+        enso.recentre(s[: pd.Period("1995-06", "M")].drop(pd.Period("1993-03", "M")), base=(1993, 1993))
+
+
+def test_hadisst_1940s_labels_end_to_end():
+    # PSL text whose base period sits 0.2 degC warmer than 1991-2020, so
+    # 1991-2020 reads -0.2. Re-centring lifts a +0.35 spell (Jun-Dec 1941) to
+    # +0.55, and its 3-month means pass +0.5 from July to November.
+    years = range(1940, 2021)
+    rows = []
+    for y in years:
+        vals = [-0.2 if y >= 1991 else 0.0] * 12
+        if y == 1941:
+            vals = [0.0] * 5 + [0.35] * 7
+        rows.append(f" {y} " + " ".join(f"{v:.2f}" for v in vals))
+    text = "\n".join([" 1940 2020", *rows, "  -99.99", "  HadISST Nino 3.4 anomaly"])
+    raw = enso.parse_psl_monthly(text)
+    oni = enso.running_mean_3(enso.recentre(raw))
+    phases = enso.enso_phases(oni)
+    t = geo.to_epoch_hours(np.array(["1941-03-01", "1941-08-01", "1941-11-15"], dtype="datetime64[s]"))
+    assert list(enso.label_times(t, phases)) == ["neutral", "el_nino", "el_nino"]
+    # On the old base the spell stays below the threshold.
+    assert (enso.enso_phases(enso.running_mean_3(raw)) != "el_nino").all()
+    np.testing.assert_allclose(enso.index_at_times(t[1:2], oni), [0.55])

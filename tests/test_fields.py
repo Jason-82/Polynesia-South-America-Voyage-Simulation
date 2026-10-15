@@ -5,9 +5,11 @@ from numpy.testing import assert_allclose, assert_array_equal
 
 from voyage_sim import geo
 from voyage_sim.fields import (
+    Environment,
     FunctionField,
     GriddedField,
     MonthlyClimatologyField,
+    SumField,
     UniformField,
     monthly_climatology,
 )
@@ -264,6 +266,31 @@ def test_climatology_is_linear_between_centres_and_cyclic(climatology, year):
 def test_climatology_outside_space_or_nan_time_is_nan(climatology):
     u, v = climatology.sample(np.array([-151.0, -120.0]), np.array([-10.0, -10.0]), np.array([0.0, NAN]))
     assert np.all(np.isnan(u)) and np.all(np.isnan(v))
+
+
+def test_sum_field_adds_the_two_and_is_nan_where_either_is(field, climatology):
+    # Winds plus a monthly anomaly on a smaller grid. The third point is outside the anomaly's grid,
+    # the fourth after the winds end.
+    total = SumField(field, climatology)
+    lon = np.array([-120.0, -101.0, -155.0, -120.0])
+    lat = np.array([-10.0, -29.0, -10.0, -10.0])
+    t = np.array([20.0, 90.0, 20.0, 200.0])
+    (au, av), (bu, bv) = field.sample(lon, lat, t), climatology.sample(lon, lat, t)
+    assert np.isfinite(au[2]) and np.isfinite(bu[3])
+    u, v = total.sample(lon, lat, t)
+    assert u.dtype == v.dtype == np.float64
+    assert_allclose(u[:2], au[:2] + bu[:2], rtol=1e-12)
+    assert_allclose(v[:2], av[:2] + bv[:2], rtol=1e-12)
+    assert np.all(np.isnan(u[2:])) and np.all(np.isnan(v[2:]))
+
+
+def test_environment_wind_cap():
+    calm = UniformField(0.0, 0.0)
+    assert Environment(calm, calm).wind_cap_ms == 50.0
+    assert Environment(calm, calm, wind_cap_ms=None).wind_cap_ms is None
+    for bad in (0.0, -5.0, NAN):
+        with pytest.raises(ValueError, match="wind_cap_ms"):
+            Environment(calm, calm, wind_cap_ms=bad)
 
 
 def test_monthly_climatology_recovers_monthly_means_with_nans():

@@ -1,0 +1,87 @@
+# Departure points, steering targets and the start points of the validation
+# voyages (SPEC "Experiments" and "Validation").
+#
+# Every position is a point about 3 km (2-5 km) off the shore on the open-ocean
+# side, so a voyage starts at sea and a strategy steers for open water. For a
+# Polynesian departure that is the side facing the Americas (east); for a port,
+# the nearest open water off it. The points were placed on GSHHG 2.3.7
+# shorelines (Pitcairn after its shoreline is moved onto the reference, see
+# configs/landmasses.yaml); without GSHHG they are still at sea, but the
+# placeholder coast is only accurate to some km.
+#
+# Schema
+# ------
+# departures | targets | validation:      # each a list
+#   - name: Fatu Hiva                     # unique within its list
+#     lon: -138.584                       # degrees east
+#     lat: -10.485                        # degrees north
+#     group: South Marquesas              # catalog group the place belongs to (configs/landmasses.yaml):
+#                                         # home of a departure, destination of a target
+#     note: "..."
+# validation entries also have
+#     start: "1976-05-01T22:00"           # launch time, UTC (a bare date is 00 UTC); where only the
+#                                         # local date is known, local noon
+#     target: Tahiti                      # a name in targets
+#
+# lon and lat are separate keys here; configs/landmasses.yaml writes [lon, lat] pairs.
+
+departures:
+  # Polynesia (SPEC: Fatu Hiva, Nuku Hiva, Mangareva, Pukarua, Rapa Nui)
+  - {name: Fatu Hiva, lon: -138.584, lat: -10.485, group: South Marquesas,
+     note: "South Marquesas, earliest admixture date (1150 CE); off the east coast"}
+  - {name: Nuku Hiva, lon: -139.976, lat: -8.863, group: North Marquesas,
+     note: "North Marquesas; off the east coast"}
+  - {name: Mangareva, lon: -134.802, lat: -23.112, group: Gambier,
+     note: "Gambier; east of the lagoon's barrier-reef motu"}
+  - {name: Pukarua, lon: -136.953, lat: -18.313, group: Tuamotus,
+     note: "eastern Tuamotus (the owner may prefer the Palliser group, which has an admixture date); off the east rim"}
+  - {name: Rapa Nui, lon: -109.206, lat: -27.119, group: Rapa Nui,
+     note: "answers question 3 only (settled about 1200 CE); off Poike, the east end"}
+  # The Americas: one port per coast segment (SPEC), and three alternatives
+  - {name: Tumaco, lon: -78.775, lat: 1.851, group: "Coast: Colombia", note: "port at 1.791N 78.793W (fact-check)"}
+  - {name: Manta, lon: -80.743, lat: -0.910, group: "Coast: Ecuador", note: "port at 0.949S 80.731W (fact-check)"}
+  - {name: Paita, lon: -81.106, lat: -5.053, group: "Coast: Northern Peru", note: "port at 5.089S 81.114W (fact-check)"}
+  - {name: Callao, lon: -77.176, lat: -12.043, group: "Coast: Southern Peru",
+     note: "port at 12.052S 77.135W (fact-check); north of Isla San Lorenzo"}
+  - {name: Arica, lon: -70.340, lat: -18.440, group: "Coast: Northern Chile",
+     note: "port at 18.476S 70.301W (fact-check)"}
+  - {name: Salango, lon: -80.867, lat: -1.562, group: "Coast: Ecuador",
+     note: "alternative to Manta: Salango 1.592S 80.843W (fact-check), a pre-Columbian trading site"}
+  - {name: Ilo, lon: -71.373, lat: -17.623, group: "Coast: Southern Peru",
+     note: "alternative to Callao: Ilo 17.632S 71.341W (fact-check)"}
+  - {name: Antofagasta, lon: -70.428, lat: -23.624, group: "Coast: Northern Chile",
+     note: "alternative to Arica: Antofagasta 23.651S 70.398W (fact-check)"}
+
+targets:
+  - {name: Manta, lon: -80.743, lat: -0.910, group: "Coast: Ecuador",
+     note: "for Marquesas and Tuamotu departures (question 1); as the departure point"}
+  - {name: Callao, lon: -77.176, lat: -12.043, group: "Coast: Southern Peru",
+     note: "for Mangareva and Rapa Nui departures (question 3); as the departure point"}
+  - {name: Fatu Hiva, lon: -138.584, lat: -10.485, group: South Marquesas,
+     note: "for American departures (question 2); off the east coast, facing them"}
+  - {name: Rapa Nui, lon: -109.206, lat: -27.119, group: Rapa Nui,
+     note: "for American departures (question 3) and Kon-Tiki2; off the east end"}
+  - {name: Tahiti, lon: -149.403, lat: -17.488, group: Society Islands,
+     note: "Hōkūleʻa 1976 southbound; off the north coast"}
+  - {name: Oʻahu, lon: -157.974, lat: 21.290, group: Hawaiian Islands,
+     note: "Hōkūleʻa 1976 northbound; off the south coast"}
+  - {name: Raroia, lon: -142.330, lat: -16.071, group: Tuamotus,
+     note: "Kon-Tiki 1947 (wrecked on its reef); off the east rim"}
+  - {name: Valparaíso, lon: -71.613, lat: -33.003, group: "Coast: Central Chile",
+     note: "Kon-Tiki2 return leg by the westerlies route; port at 33.03S 71.62W"}
+
+validation:
+  - {name: Hōkūleʻa 1976 southbound, lon: -156.667, lat: 21.041, group: Hawaiian Islands, start: "1976-05-01T22:00",
+     target: Tahiti, note: "Honolua Bay, Maui (21.014N 156.639W), May 1; hour not documented, local noon (UTC-10)"}
+  - {name: Hōkūleʻa 1976 northbound, lon: -149.593, lat: -17.514, group: Society Islands, start: "1976-07-04T22:00",
+     target: Oʻahu, note: "off Papeete harbour (17.535S 149.570W), July 4; taken as local noon (UTC-10)"}
+  - {name: Hōkūleʻa 1999, lon: -130.083, lat: -25.043, group: Pitcairn Islands, start: "1999-09-25T06:00",
+     target: Rapa Nui, note: "off Bounty Bay, Pitcairn; left late on September 24 local time (UTC-8), taken as 22:00"}
+  - {name: Kon-Tiki 1947, lon: -77.925, lat: -12.052, group: "Coast: Southern Peru", start: "1947-04-28T17:00",
+     target: Raroia, note: "released about 86 km (50 nautical miles) west of Callao on April 28 or 29 after a tow;
+       April 28, local noon (UTC-5)"}
+  - {name: Kon-Tiki2 2015 outbound, lon: -77.176, lat: -12.043, group: "Coast: Southern Peru",
+     start: "2015-11-07T17:00", target: Rapa Nui, note: "Callao, November 7; taken as local noon (UTC-5)"}
+  - {name: Kon-Tiki2 2016 return, lon: -109.463, lat: -27.127, group: Rapa Nui, start: "2016-01-06T17:00",
+     target: Valparaíso, note: "off Hanga Roa, Rapa Nui (27.145S 109.435W), January 6, taken as local noon
+       (UTC-5); westerlies route toward Chile"}

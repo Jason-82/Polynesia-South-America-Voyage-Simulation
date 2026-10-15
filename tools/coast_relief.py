@@ -1,13 +1,27 @@
 """Near-shore relief along the Pacific coast of South America from Copernicus GLO-90 DSM.
 
 For each 0.1 deg latitude band, max elevation of mainland pixels within D km of the
-Pacific (ocean = DSM value 0, connected to the western edge of the mosaic).
+Pacific (ocean = DSM value 0, connected to the western edge of the mosaic). The
+result feeds configs/coast_relief.csv, whose max5 column is the sighting height
+of each 0.1 deg coast piece in voyage_sim.catalog.
+
+Usage (needs rasterio and scipy; downloads 1-degree DSM tiles on demand)::
+
+    python tools/coast_relief.py DEM_DIR NE_DIR OUT.json [SOUTH NORTH]
+
+DEM_DIR caches the GLO-90 tiles (a ``.missing`` marker for all-ocean tiles),
+NE_DIR holds Natural Earth's ne_10m_coastline.geojson (used only to find the
+coast's longitude in each 1-degree band), and SOUTH NORTH bound the latitudes
+of coastline points considered (default -26 7.3: Colombia to northern Chile).
+OUT.json gets one record per band: lat (band centre), maxD and lonD for D in
+5, 10, 20, 40 km, and coast_lon_w; convert it to CSV rows to extend the table.
 """
 import json, math, os, subprocess, sys
 import numpy as np, rasterio
 from scipy import ndimage
 
 DEM, NE, OUT = sys.argv[1], sys.argv[2], sys.argv[3]
+SOUTH, NORTH = (float(x) for x in sys.argv[4:6]) if len(sys.argv) > 5 else (-26.0, 7.3)
 PX = 1 / 1200.0  # 3 arcsec
 DISTS = (5, 10, 20, 40)
 
@@ -19,7 +33,7 @@ for f in coast:
     lines = g["coordinates"] if g["type"] == "MultiLineString" else [g["coordinates"]]
     for L in lines:
         for lon, lat in L:
-            if -26 <= lat <= 7.3 and -81.5 <= lon <= -69.5:
+            if SOUTH <= lat <= NORTH and -81.5 <= lon <= -69.5:
                 b = math.floor(lat)
                 lo, hi = bandlon.get(b, (999, -999))
                 bandlon[b] = (min(lo, lon), max(hi, lon))
