@@ -84,10 +84,19 @@ vessels:
       <<: *canoe_sources
       min_twa_deg: "Anderson et al. 2006: early canoes could not sail upwind; 90 deg, no windward sailing, tests that hypothesis (SPEC)"
 
+  # Sensitivity variant of canoe_90: broad reach and run only (SPEC stress test
+  # "windward limit").
+  canoe_120:
+    <<: *canoe_75
+    min_twa_deg: 120
+    sources:
+      <<: *canoe_sources
+      min_twa_deg: "SPEC windward-limit stress test: the no-windward canoe limited to 120 deg off the wind"
+
   # South American balsa sailing raft steered with guaras (centreboards).
   # Every value is a placeholder until the Dewan & Hosler (2008) numbers are
   # adopted (SPEC open question).
-  raft_sailing:
+  raft_sailing: &raft_sailing
     kind: sailing
     min_twa_deg: 85
     min_sail_tws_kn: 3.0
@@ -109,9 +118,22 @@ vessels:
       heave_to_tws_kn: "PROVISIONAL: pending Dewan & Hosler 2008; sail lowered at Beaufort force 8 (34 kn)"
       speed_scale: "PROVISIONAL: pending Dewan & Hosler 2008; baseline 1.0"
       polar.max_speed_kn: "PROVISIONAL: pending Dewan & Hosler 2008; ~4 kn top speed assumed"
-      polar.wind_ratio: "PROVISIONAL: pending Dewan & Hosler 2008; ~2.3 kn in 15 kn of wind; calibrate on Kon-Tiki 1947 (Peru to the Tuamotus, 101 days)"
+      polar.wind_ratio: "PROVISIONAL: pending Dewan & Hosler 2008; ~2.3 kn in 15 kn of wind. If tuned to Kon-Tiki 1947 (release to first sighting of Puka-Puka, about 93 days) or Kon-Tiki2, report those checks as calibration (SPEC)"
       polar.angle_factors: "PROVISIONAL: pending Dewan & Hosler 2008; square sail, best running before the wind"
       leeway: "SAROPS leeway table, class REFUGEE-RAFT-1 (DW 1.56% + 8.3 cm/s, CW 0.078% + 2.7 cm/s; Allen & Plourde 1999 p. 2-16, via OpenDrift OBJECTPROP.DAT); nearest raft class, a balsa raft's mast and cabin not represented (SPEC leeway stress test +/-50%)"
+
+  # Kon-Tiki 1947: the same raft with its guaras unused, so it cannot hold a course
+  # off the wind (SPEC validation).
+  raft_no_guaras:
+    <<: *raft_sailing
+    min_twa_deg: 120
+    sources:
+      min_twa_deg: "Kon-Tiki 1947: the crew could not work the guaras, so the raft mostly ran before the wind (Kon-Tiki Museum); 120 deg is PROVISIONAL"
+      min_sail_tws_kn: "PROVISIONAL: as raft_sailing"
+      heave_to_tws_kn: "PROVISIONAL: as raft_sailing"
+      speed_scale: "PROVISIONAL: as raft_sailing"
+      polar: "PROVISIONAL: as raft_sailing (Dewan & Hosler 2008 pending)"
+      leeway: "As raft_sailing: SAROPS REFUGEE-RAFT-1, nearest raft class"
 
   # Swamped or unrigged canoe: no steering, current plus leeway (SPEC "drifting craft").
   drift_canoe:

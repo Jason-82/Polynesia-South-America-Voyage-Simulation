@@ -31,8 +31,8 @@ anywhere in the hot path.
 config YAML ──► run.py ──► fields.Environment ─┐
                      ├──► vessels.Vessel ──────┤
                      ├──► strategies.Strategy ─┼──► simulate.simulate() ──► VoyageResults ──► analyze
-                     ├──► landfall.LandfallDetector (one SightingRaster per sighting rule)
-                     └──► simulate.Launches
+                     ├──► catalog.Catalog ──► landfall.LandfallDetector (one SightingRaster per rule)
+                     └──► simulate.Launches (departures, targets, destination groups)
 ```
 
 ## Modules
@@ -88,10 +88,17 @@ def monthly_climatology(time, u, v) -> tuple[np.ndarray, np.ndarray]:
     # NaN-aware mean by calendar month of gridded data -> (u12, v12).
 
 @dataclass
+class SumField:                # a + b; e.g. ERA5 winds plus a last-millennium
+    a: VectorField             # monthly anomaly (a MonthlyClimatologyField)
+    b: VectorField
+
+@dataclass
 class Environment:
     wind: VectorField          # 10 m wind
     current: VectorField       # surface current
     current_is_climatology: bool = False   # flagged in outputs (pre-1993 runs)
+    wind_cap_ms: float | None = 50.0       # ERA5 has rare spurious winds up to ~300 m/s;
+                                           # the simulator caps the speed and counts caps
 ```
 
 ### `vessels.py`: what a hull and rig can do
@@ -200,10 +207,14 @@ class SightingRule:
     radius_km: float = 40.0    # uniform mode
     eye_height_m: float = 3.0
     refraction_k: float = 0.13
-    scale: float = 1.0         # multiplies height-based radii (sensitivity)
+    scale: float = 1.0         # multiplies height-based radii, bird range included
+    bird_km: float = 0.0       # height mode: islands and atolls (not coasts) are in
+                               # sight within max(visual range, bird_km) (SPEC: 37 km)
     floor_km: float = 0.0
     cap_km: float = inf
-    def radius_km_for(self, height_m) -> np.ndarray
+    def radius_km_for(self, height_m, kind) -> np.ndarray
+        # uniform: radius_km for every landmass.
+        # height: clip(scale * max(visual, bird_km if kind != "coast" else 0), floor_km, cap_km)
 
 def geometric_range_km(target_height_m, eye_height_m=3.0, refraction_k=0.13)
     # sqrt(2 R' h_target) + sqrt(2 R' h_eye), R' = R / (1 - k)
@@ -224,8 +235,12 @@ class SightingRaster:
 class LandfallDetector:
     def __init__(self, landmasses, rasters, substep_km=2.0)
     groups: list[str]; landmass_group: np.ndarray[int]   # landmass index -> group index
-    def check_segment(self, lon0, lat0, lon1, lat1, origin_group, armed, active):
-        # -> (hit, frac, landmass, armed_new), each shaped (n_rules, n).
+    def check_segment(self, lon0, lat0, lon1, lat1, origin_group, armed, active,
+                      eligible=None, rules=None):
+        # -> (hit, frac, landmass, armed_new), each shaped (len(rules), n).
+        # eligible: optional (n, n_groups) bool; a sighting counts only for groups
+        # the voyage may land on (its destinations). rules: raster indices to
+        # check (default all).
         # Swept-path test: a segment is skipped only if
         #   min(margin_start, margin_end) > 0.75 * length + raster cell size,
         # which guarantees no sighting along it; otherwise it is sampled every
@@ -236,8 +251,30 @@ class LandfallDetector:
         # until the voyage has once been out of sight of all land (armed).
 
 def circle_ring(lon, lat, radius_km, n=64) -> np.ndarray      # test / placeholder geometry
-def load_catalog(path) -> list[Landmass]                        # configs/landmasses.yaml
+def load_catalog(path) -> list[Landmass]                        # explicit landmass lists
 def attach_gshhg(landmasses, shp_path) -> list[Landmass]        # real shorelines (optional)
+```
+
+### `catalog.py`: the land in the study domain
+
+Builds the landmass list the detector uses, with groups, regions and sighting
+heights, from `configs/landmasses.yaml` and (when downloaded) GSHHG shorelines.
+
+```python
+@dataclass
+class Catalog:
+    landmasses: list[Landmass]
+    group_region: dict[str, str]   # group -> "polynesia" | "americas" | "offshore" | "other"
+    def groups_in(self, *regions) -> list[str]
+
+def build_catalog(config_path, gshhg_dir=None, cache_dir=None) -> Catalog
+    # With GSHHG: every level-1 polygon in the domain becomes land. Polygons of
+    # one island or atoll (motu) are merged into one landmass; ocean islands get
+    # their group from region boxes in the config; the continental Pacific shore
+    # (inside a Pacific mask) is cut into 0.1 deg latitude pieces whose height
+    # is the coastal relief within 5 km (configs/coast_relief.csv). Named islands
+    # carry literature heights; others take their group's default (atolls:
+    # trees, about 18 m). Without GSHHG: placeholder circles from the config.
 ```
 
 ### `simulate.py`: the integrator
@@ -250,6 +287,10 @@ class Launches:
     t0: np.ndarray             # epoch hours of launch (waiting starts here)
     origin_group: np.ndarray   # int index into detector.groups
     target_lon, target_lat: np.ndarray   # NaN if no target
+    dest_groups: np.ndarray | None = None
+        # (n, n_groups) bool: the groups whose sighting ends the voyage (SPEC:
+        # the far side; home for a return leg). None = any group but home.
+        # Land of other groups is recorded once, under rule 0, as other_*.
 
 @dataclass
 class SimConfig:
@@ -257,7 +298,9 @@ class SimConfig:
     max_days_at_sea: float = 90.0   # horizon; shorter supply limits are applied afterwards
     integrator: str = "midpoint"    # "midpoint" (RK2) | "euler"
     speed_sd: float = 0.10          # per-voyage speed factor ~ N(1, sd), floored at 0.3
-    heading_sd_deg: float = 10.0    # per-step steering error
+    heading_sd_deg: float = 10.0    # steering error per 6-hour step; scaled by
+                                    # sqrt(6 / dt_hours) so the spread it causes
+                                    # does not depend on the time step
     diffusivity_m2s: float = 0.0    # random-walk dispersion K: step sd = sqrt(2 K dt) per axis
     track_every: int = 4            # record a position every N steps (0 = none)
     seed: int = 0
@@ -293,6 +336,7 @@ counts.
 class VoyageResults:
     voyage_id, launch_t, depart_t, end_t, end_lon, end_lat, days_at_sea, status
     hit_days, hit_landmass, hit_lon, hit_lat     # (n_rules, n); NaN / -1 when no sighting
+    other_days, other_landmass, other_lon, other_lat   # (n,) first non-destination land, rule 0
     rule_names, landmass_names, landmass_groups, group_names
     tracks: np.ndarray | None                    # (n, n_rec, 2) float32 lon/lat
     track_days: np.ndarray | None                # (n_rec,) days since launch
@@ -305,33 +349,63 @@ class VoyageResults:
 ### `enso.py`: climate-state labels
 
 ```python
-def parse_cpc_oni(text) -> pd.Series          # CPC oni.ascii.txt -> ONI by centre month
+def parse_cpc_seasonal(text) -> pd.Series     # CPC oni.ascii.txt or RONI.ascii.txt (ANOM is the
+                                              # last column) -> index by centre month
+parse_cpc_oni = parse_cpc_seasonal
 def parse_psl_monthly(text) -> pd.Series      # PSL year + 12 values format, missing flagged
 def running_mean_3(series) -> pd.Series       # centred 3-month mean
 def enso_phases(oni, threshold=0.5, min_run=5) -> pd.Series   # "el_nino" | "la_nina" | "neutral"
 def label_times(t_hours, phases) -> np.ndarray  # phase of each launch's calendar month
+def index_at_times(t_hours, index) -> np.ndarray  # index value of each launch's month (NaN if none)
+def enso_year(t_hours) -> np.ndarray            # July-June year (Jul 1997-Jun 1998 -> 1997);
+                                                # the bootstrap cluster, so one event is one cluster
 ```
 
-### `analyze.py`: odds, durations, intervals
+### `analyze.py`: probabilities, durations, intervals
 
 ```python
 def success(results, rule, supply_days, dest_groups=None) -> np.ndarray[bool]
 def cluster_bootstrap(success, clusters, n_boot=2000, seed=0, level=0.95) -> dict
-    # Resample clusters (launch years) with replacement; ratio of sums;
+    # Resample clusters (July-June launch years) with replacement; ratio of sums;
     # percentile interval. Returns p, lo, hi, n, n_clusters.
 def duration_summary(days) -> dict            # median, p90, n
 def summarize(results, labels, rules, supplies, dest_groups, by) -> pd.DataFrame
+# Planned (milestone 3): round_trip(out, back, rule, supply_days, min_stay_days,
+# max_wait_days, home_groups) pairing outbound landfalls with return legs.
 ```
+
+### `plots.py` (planned, milestone 5)
+
+Track bundles, and landfall density maps that project each first sighting of
+a destination onto the nearest point of its landmass's shoreline.
 
 ### `fetch.py`: data access (network; never called by tests)
 
-ERA5 via `cdsapi`, GLORYS via `copernicusmarine.subset`, GSHHG and ENSO
-indices via HTTPS. Every function has a `dry_run` that returns the requests it
-would make; tests check those requests only. Imports of `cdsapi` and
-`copernicusmarine` are lazy so the core runs without them.
+Every function takes `dry_run` and then returns the requests it would make;
+tests check those requests only. `cdsapi` and `copernicusmarine` are imported
+lazily so the core runs without them. Downloads skip files already present.
+
+```python
+DOMAIN = {"north": 30, "south": -50, "west": -165, "east": -65}
+
+def era5_request(year, month, hours=(0, 6, 12, 18), area=DOMAIN) -> dict
+    # reanalysis-era5-single-levels, 10 m u/v, NetCDF, one month per request
+def fetch_era5(years, months, out_dir, hours=..., dry_run=False) -> list
+def fetch_glorys(start, end, out_dir, dry_run=False) -> list
+    # copernicusmarine.subset of uo/vo at the top level, per year;
+    # cmems_mod_glo_phy_my_0.083deg_P1D-m to 2021-06-30, then ..._myint_...
+def coarsen_currents(path_in, path_out, factor=3)   # 1/12 deg -> 0.25 deg block means
+def build_current_climatology(paths, path_out)      # monthly means for pre-1993 runs
+def fetch_gshhg(out_dir, dry_run=False)             # GitHub release zip, SHA-256 checked
+def fetch_enso_indices(out_dir, dry_run=False)      # CPC RONI and ONI, PSL HadISST Nino-3.4
+```
 
 ### `run.py`: one command per scenario grid
 
 `voyage-sim run configs/<grid>.yaml` builds everything from the config, runs
-each cell, writes `outputs/<name>/` (results `.npz`, `summary.csv`, the
-resolved config), and gives identical bytes on rerun.
+each cell, and writes `outputs/<name>/`: one results `.npz` per cell, a
+`summary.csv` of success probabilities and durations, and the resolved
+config. Rerunning gives byte-identical files. A config names the environment
+(synthetic fields, or ERA5/GLORYS files), the catalog, sighting rules, vessels,
+strategies, departures and targets from `configs/places.yaml`, the launch
+schedule, the simulation settings and the analysis settings.
