@@ -1,0 +1,13 @@
+# Simulation outputs and downloaded data are reproducible from configs
+outputs/
+data/
+cache/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+build/
+dist/

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voyage-sim"
+version = "0.1.0"
+description = "Simulated voyages between eastern Polynesia and South America"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "pandas>=2.1",
+    "xarray>=2024.1",
+    "netCDF4>=1.6",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+fetch = ["cdsapi>=0.7", "copernicusmarine>=2.0", "pyshp>=2.3"]
+dev = ["pytest>=8"]
+
+[project.scripts]
+voyage-sim = "voyage_sim.run:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
