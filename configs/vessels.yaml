@@ -1,0 +1,145 @@
+# Vessel settings: what each hull and rig can do.
+#
+# Read by voyage_sim.vessels.load_vessels(); each entry becomes a Vessel.
+# Speeds are knots (converted to m/s where they are used); angles are true wind
+# angles (TWA): 0 = head to wind, 180 = dead downwind. Leeway coefficients are
+# SI: m/s of drift per m/s of 10 m wind, and m/s offsets.
+#
+# Schema
+# ------
+# vessels:
+#   <name>:
+#     kind: sailing | drift      # drift craft never sail; they move by leeway only
+#     min_twa_deg: 75            # closest angle to the wind it can sail (default 180)
+#     min_sail_tws_kn: 2         # becalmed below this true wind speed: drifts (default 0)
+#     heave_to_tws_kn: 34        # at or above this: stops sailing, drifts (default .inf)
+#     speed_scale: 1.0           # multiplies polar speeds; sensitivity knob (default 1)
+#     polar:                     # sailing vessels only: boat speed through the water
+#       type: parametric         # speed = min(max_speed_kn, wind_ratio * TWS) * f(TWA)
+#       min_twa_deg: 75          # optional: f = 0 below it (default: the vessel's min_twa_deg;
+#                                #   must not exceed it, or the vessel would sail at 0 kn)
+#       max_speed_kn: 7
+#       wind_ratio: 0.45         # knots of boat speed per knot of wind, below the cap
+#       angle_factors: [[75, 0.7], [90, 0.9], ...]  # f, piecewise-linear; flat beyond the ends
+#     polar:                     # ...or a measured table
+#       type: table              # bilinear in (TWA, TWS), clipped to the table's range
+#       twa_deg: [...]           # ascending, within [0, 180]
+#       tws_kn: [0, ...]         # ascending, starting at 0
+#       speed_kn: [[...], ...]   # one row per twa_deg, one column per tws_kn
+#     leeway:                    # drift through the water whenever not sailing
+#       dw_slope: 0.04           # downwind  = max(0, dw_slope * W10 + dw_offset_ms)
+#       dw_offset_ms: 0.0        #   (W10 = 10 m wind speed relative to the water, m/s)
+#       cw_slope: 0.015          # crosswind = max(0, cw_slope * W10 + cw_offset_ms),
+#       cw_offset_ms: 0.0        #   to the right or left of downwind, fixed per voyage
+#     sources:                   # parameter -> citation, for the report's parameter table
+#       min_twa_deg: "..."       # keys are dotted paths (polar.wind_ratio, leeway.dw_slope);
+#       leeway: "..."            # a parent key (polar, leeway) covers all its parameters
+#
+# Only dw_slope (and kind, leeway, and polar for sailing vessels) is required.
+# Every numeric parameter given must have a source: load_vessels() rejects a
+# vessel that lacks one, or whose sources name a parameter it does not have.
+# A value not yet backed by a published number says PROVISIONAL and what it is
+# waiting on; these are starting values, to be replaced with researched numbers
+# and calibrated against the validation voyages (SPEC "Validation").
+# The SAROPS leeway table (OpenDrift OBJECTPROP.DAT) gives slopes in % and
+# intercepts in cm/s; divide both by 100.
+
+vessels:
+
+  # Double canoe that can work to windward, after Hōkūleʻa and Finney's
+  # reconstructions.
+  canoe_75: &canoe_75
+    kind: sailing
+    min_twa_deg: 75
+    min_sail_tws_kn: 2.0
+    heave_to_tws_kn: 34.0
+    speed_scale: 1.0
+    polar:
+      type: parametric
+      max_speed_kn: 7.0
+      wind_ratio: 0.45
+      angle_factors: [[75, 0.70], [90, 0.90], [110, 1.00], [150, 1.00], [180, 0.85]]
+    leeway:                    # canoe with sail lowered (becalmed or hove to)
+      dw_slope: 0.0315
+      dw_offset_ms: 0.0
+      cw_slope: 0.0129
+      cw_offset_ms: 0.0
+    sources: &canoe_sources
+      min_twa_deg: "Finney: reconstructed double canoes sail about 75 deg off the wind"
+      min_sail_tws_kn: "PROVISIONAL: below ~2 kn of wind a laden canoe has no steerage; treated as becalmed"
+      heave_to_tws_kn: "PROVISIONAL: Beaufort force 8 (gale, 34 kn); sail lowered and canoe hove to"
+      speed_scale: "Baseline 1.0; SPEC sensitivity test varies canoe speed by +/-20%"
+      polar.max_speed_kn: "PROVISIONAL: ~7 kn top laden speed, above Hōkūleʻa's 4-6 kn typical (Hōkūleʻa specifications); calibrate on the 1976 voyages"
+      polar.wind_ratio: "PROVISIONAL: ~4 kn in 10 kn and ~6 kn in 15 kn of wind on a beam reach, Hōkūleʻa's 4-6 kn laden (Hōkūleʻa specifications); calibrate on the 1976 voyages"
+      polar.angle_factors: "PROVISIONAL: slowest close-hauled, fastest broad reaching, slower dead downwind (after Finney); calibrate on the 1976 voyages"
+      leeway: "SAROPS leeway table, class SKIFF-1 (DW 3.15%, CW 1.29%, no offsets; Allen 2005 method, table as distributed in OpenDrift OBJECTPROP.DAT); nearest small open boat class, rig windage not represented (SPEC leeway stress test +/-50%)"
+
+  # The same hull and rig, unable to sail upwind (Anderson et al.'s hypothesis).
+  # Everything but min_twa_deg is inherited from canoe_75; the polar's zero
+  # region follows the vessel's min_twa_deg.
+  canoe_90:
+    <<: *canoe_75
+    min_twa_deg: 90
+    sources:
+      <<: *canoe_sources
+      min_twa_deg: "Anderson et al. 2006: early canoes could not sail upwind; 90 deg, no windward sailing, tests that hypothesis (SPEC)"
+
+  # South American balsa sailing raft steered with guaras (centreboards).
+  # Every value is a placeholder until the Dewan & Hosler (2008) numbers are
+  # adopted (SPEC open question).
+  raft_sailing:
+    kind: sailing
+    min_twa_deg: 85
+    min_sail_tws_kn: 3.0
+    heave_to_tws_kn: 34.0
+    speed_scale: 1.0
+    polar:
+      type: parametric
+      max_speed_kn: 4.0
+      wind_ratio: 0.15
+      angle_factors: [[85, 0.60], [110, 0.80], [140, 1.00], [180, 1.00]]
+    leeway:                    # raft with sail lowered, guaras down
+      dw_slope: 0.0156
+      dw_offset_ms: 0.083
+      cw_slope: 0.00078
+      cw_offset_ms: 0.027
+    sources:
+      min_twa_deg: "PROVISIONAL: pending Dewan & Hosler 2008; guaras allow some reaching, assumed no closer than 85 deg"
+      min_sail_tws_kn: "PROVISIONAL: pending Dewan & Hosler 2008; heavy raft assumed becalmed below 3 kn"
+      heave_to_tws_kn: "PROVISIONAL: pending Dewan & Hosler 2008; sail lowered at Beaufort force 8 (34 kn)"
+      speed_scale: "PROVISIONAL: pending Dewan & Hosler 2008; baseline 1.0"
+      polar.max_speed_kn: "PROVISIONAL: pending Dewan & Hosler 2008; ~4 kn top speed assumed"
+      polar.wind_ratio: "PROVISIONAL: pending Dewan & Hosler 2008; ~2.3 kn in 15 kn of wind; calibrate on Kon-Tiki 1947 (Peru to the Tuamotus, 101 days)"
+      polar.angle_factors: "PROVISIONAL: pending Dewan & Hosler 2008; square sail, best running before the wind"
+      leeway: "SAROPS leeway table, class REFUGEE-RAFT-1 (DW 1.56% + 8.3 cm/s, CW 0.078% + 2.7 cm/s; Allen & Plourde 1999 p. 2-16, via OpenDrift OBJECTPROP.DAT); nearest raft class, a balsa raft's mast and cabin not represented (SPEC leeway stress test +/-50%)"
+
+  # Swamped or unrigged canoe: no steering, current plus leeway (SPEC "drifting craft").
+  drift_canoe:
+    kind: drift
+    leeway:
+      dw_slope: 0.0315
+      dw_offset_ms: 0.0
+      cw_slope: 0.0129
+      cw_offset_ms: 0.0
+    sources:
+      leeway: "SAROPS leeway table, class SKIFF-1 (DW 3.15%, CW 1.29%, no offsets; Allen 2005 method, table as distributed in OpenDrift OBJECTPROP.DAT); nearest small open boat class (SPEC leeway stress test +/-50%)"
+
+  # Unrigged balsa raft adrift: little above the water, so little leeway.
+  drift_raft:
+    kind: drift
+    leeway:
+      dw_slope: 0.0156
+      dw_offset_ms: 0.083
+      cw_slope: 0.00078
+      cw_offset_ms: 0.027
+    sources:
+      leeway: "SAROPS leeway table, class REFUGEE-RAFT-1 (DW 1.56% + 8.3 cm/s, CW 0.078% + 2.7 cm/s; Allen & Plourde 1999 p. 2-16, via OpenDrift OBJECTPROP.DAT); nearest raft class (SPEC leeway stress test +/-50%)"
+
+  # Seed capsules carried by currents alone: the Montenegro et al. (2008)
+  # comparison object (SPEC validation), no wind push at all.
+  seed_capsule:
+    kind: drift
+    leeway:
+      dw_slope: 0.0
+    sources:
+      leeway.dw_slope: "Montenegro et al. 2008 drifted seed capsules on currents alone (as summarized by Ioannidis et al. 2020)"
