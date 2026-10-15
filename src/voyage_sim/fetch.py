@@ -87,6 +87,8 @@ _CHUNK_BYTES = 1 << 20
 def era5_request(year, month, hours=(0, 6, 12, 18), area=DOMAIN) -> dict:
     """CDS request for one month of 10 m u and v at ``hours`` (UTC) over ``area``, as NetCDF."""
     n_days = calendar.monthrange(int(year), int(month))[1]
+    if bad := [h for h in hours if int(h) != h or not 0 <= h <= 23]:
+        raise ValueError(f"bad hour {bad[0]}; must be a whole hour 0-23")
     return {
         "product_type": ["reanalysis"],
         "variable": list(ERA5_VARIABLES),

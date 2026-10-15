@@ -20,8 +20,12 @@ for every sighting rule not yet satisfied, recording the days at sea
 (interpolated within the step), landmass and position of the first sighting of
 a destination: land of the voyage's destination groups, or any land when it
 has none; home counts only once the voyage has been out of sight of all land.
-Other land is sailed past; the first of it seen under rule 0 before a
-destination is recorded on its own (``other_*``).
+Other land is sailed past; under rule 0, the first sighting of each other
+group before a destination is recorded on its own (``other_*``, one row per
+voyage and group). Home, for that record, is the origin group, or for a
+voyage leaving the continent's coast every coast segment (the domain holds one
+continent): it counts only once the voyage has been out of sight of all land,
+so the stretch of coast next to a departure port is not land on the way.
 **Supplies left?** A voyage ends once every rule has sighted a destination
 (``END_ALL_SIGHTED``) or at the horizon (``END_HORIZON``). Because landfall is
 checked first, a sighting on the last day of supplies counts; one in the part of
@@ -32,20 +36,25 @@ the longest horizon answers every rule and every shorter limit: success under
 rule r with S days of supplies is ``hit_days[r] <= S``. A field value of NaN
 (outside the data's coverage) ends the voyage where it is (``LEFT_DOMAIN``).
 
-Steering error never carries a heading inside the vessel's no-go cone, and
-neither does a wind shift at the midpoint: a crew sailing close-hauled steers
-by the sail, so such a heading is set to close-hauled on the same side.
-Without this, every close-hauled step would stall into leeway drift about half
-the time, and upwind sailing would be badly understated.
+Steering error never carries a heading inside the strategy's no-go cone (the
+vessel's, or wider for downwind: ``Strategy.closest_twa_deg``), and neither
+does a wind shift at the midpoint: a crew sailing close-hauled steers by the
+sail, so such a heading is set to close-hauled on the same side. Without this,
+every close-hauled step would stall into leeway drift about half the time, and
+upwind sailing would be badly understated.
 
-Steering error is drawn afresh each step, so across the course it adds up as
-a random walk; its standard deviation is given per 6-hour step and scaled by
-sqrt(6 h / dt) to make the spread over a passage independent of the step.
+Steering error is one draw per voyage for each 6-hour block since launch
+(standard deviation ``heading_sd_deg``): steps shorter than 6 hours share their
+block's error, and a longer step steers the mean of its blocks' errors (sd
+scaled by sqrt(6 h / dt)). Across the course the errors add up as a random
+walk whose spread does not depend on the step, and for steps up to 6 hours
+neither does what the no-go cone clips off them (a fresh draw every short step
+would push the mean close-hauled heading further off the wind as dt shrinks).
 
 Random draws (per voyage: speed factor and side of the crosswind leeway; per
-step: steering error and random-walk displacement) come from ``noise`` keyed by
-voyage id and the step count since launch, so a voyage's track does not depend
-on which other voyages share its run.
+6-hour block: steering error; per step: random-walk displacement) come from
+``noise`` keyed by voyage id and the block or step count since launch, so a
+voyage's track does not depend on which other voyages share its run.
 
 ERA5 has rare spurious winds of up to ~300 m/s. Every wind sample faster than
 ``env.wind_cap_ms`` is slowed to it, direction kept, before anything uses it;
@@ -56,9 +65,11 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import os
 import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -69,7 +80,7 @@ from voyage_sim.strategies import StepContext, steer_toward
 # Random channels. normal(c) draws on uniform channels 2c and 2c + 1, so the
 # uniform channel sits well clear of them.
 CH_SPEED = 1      # normal, per voyage (step 0): speed factor
-CH_HEADING = 2    # normal, per step: steering error
+CH_HEADING = 2    # normal, per 6-hour block: steering error
 CH_DX = 3         # normal, per step: random walk, east
 CH_DY = 4         # normal, per step: random walk, north
 CH_CW = 100       # uniform, per voyage (step 0): side of the crosswind leeway
@@ -80,7 +91,7 @@ STATUS_NAMES = ("waiting", "at_sea", "all_sighted", "horizon", "did_not_sail", "
 
 INTEGRATORS = ("midpoint", "euler")
 _MIN_SPEED_FACTOR = 0.3
-_STEERING_HOURS = 6.0  # heading_sd_deg is the steering error over a step of this length
+_STEERING_HOURS = 6.0  # one steering error per block of this many hours (heading_sd_deg)
 _STEP_TOL = 1e-6  # a duration within this many steps of a whole number counts as that number
 
 
@@ -102,6 +113,7 @@ class Launches:
     target_lat: np.ndarray
     # (n, n_groups) bool: the groups whose sighting ends the voyage (the far side;
     # home for a return leg). None: any group, home once out of sight of all land.
+    # Other groups are recorded under rule 0 as other land (VoyageResults.other_*).
     dest_groups: np.ndarray | None = None
 
     def __post_init__(self):
@@ -140,7 +152,7 @@ class SimConfig:
     max_days_at_sea: float = 90.0   # horizon; shorter supply limits are applied afterwards
     integrator: str = "midpoint"    # "midpoint" (RK2) | "euler"
     speed_sd: float = 0.10          # per-voyage speed factor ~ N(1, sd), floored at 0.3
-    heading_sd_deg: float = 10.0    # steering error per 6-hour step; scaled by sqrt(6 / dt_hours)
+    heading_sd_deg: float = 10.0    # steering error, one draw per 6-hour block (see the module docstring)
     diffusivity_m2s: float = 0.0    # random-walk dispersion K: step sd = sqrt(2 K dt) per axis
     track_every: int = 4            # record a position every N steps (0 = none)
     seed: int = 0
@@ -158,7 +170,8 @@ class SimConfig:
 
 
 _ARRAYS = ("voyage_id", "launch_t", "depart_t", "end_t", "end_lon", "end_lat", "days_at_sea", "status",
-           "hit_days", "hit_landmass", "hit_lon", "hit_lat", "other_days", "other_landmass", "other_lon", "other_lat")
+           "hit_days", "hit_landmass", "hit_lon", "hit_lat", "other_voyage_id", "other_days", "other_landmass",
+           "other_lon", "other_lat", "other_exact")
 _INFO = ("rule_names", "landmass_names", "landmass_groups", "group_names", "current_is_climatology", "meta")
 
 
@@ -171,9 +184,13 @@ class VoyageResults:
     the last step may run past the horizon; ``hit_days`` is interpolated within
     its step and never exceeds the horizon.
     Sighting arrays are (n_rules, n): NaN (or landmass -1) where never sighted.
-    ``other_*`` (n,) is the first land outside the destination groups that came
-    into sight under rule 0 before a destination did; NaN / -1 if none, and
-    always for launches without destination groups.
+    ``other_*`` are rows, one per voyage and other group: the first sighting
+    under rule 0 of each group outside the voyage's destinations that came into
+    sight before a destination did (home only once out of sight of all land),
+    ordered by voyage then days. ``other_exact`` is False where the sighting
+    was placed where the group took over from other land in sight, so it came
+    into sight earlier (``LandfallDetector.check_segment``). Launches without
+    destination groups have none.
     """
 
     voyage_id: np.ndarray
@@ -188,10 +205,12 @@ class VoyageResults:
     hit_landmass: np.ndarray   # index into landmass_names
     hit_lon: np.ndarray        # where the voyage was at first sighting
     hit_lat: np.ndarray
-    other_days: np.ndarray     # days at sea at first sighting of other land, rule 0
-    other_landmass: np.ndarray
-    other_lon: np.ndarray
+    other_voyage_id: np.ndarray  # (m,) rows of other land: the voyage,
+    other_days: np.ndarray       # days at sea at first sighting of the group under rule 0,
+    other_landmass: np.ndarray   # the landmass sighted,
+    other_lon: np.ndarray        # where the voyage was,
     other_lat: np.ndarray
+    other_exact: np.ndarray      # and whether the sighting point is exact (not a switch)
     rule_names: list[str]
     landmass_names: list[str]
     landmass_groups: list[str]   # group name of each landmass
@@ -203,8 +222,9 @@ class VoyageResults:
 
     def to_frame(self) -> pd.DataFrame:
         """One row per voyage; per-rule columns ``hit_days_<rule>``, ``hit_landmass_<rule>``,
-        ``hit_group_<rule>``, ``hit_lon_<rule>``, ``hit_lat_<rule>``, then ``other_days``,
-        ``other_landmass``, ``other_group``, ``other_lon``, ``other_lat`` (None/NaN where never sighted)."""
+        ``hit_group_<rule>``, ``hit_lon_<rule>``, ``hit_lat_<rule>``, then the first other land:
+        ``other_days``, ``other_landmass``, ``other_group``, ``other_lon``, ``other_lat`` and
+        ``n_other`` groups sighted (None/NaN where never sighted). ``other_frame`` has every one."""
         cols = {name: getattr(self, name) for name in _ARRAYS[:7]}
         cols["status"] = np.array(STATUS_NAMES, dtype=object)[self.status]
         # Index -1 (no sighting) reads the trailing None.
@@ -216,12 +236,30 @@ class VoyageResults:
             cols[f"hit_group_{rule}"] = groups[self.hit_landmass[r]]
             cols[f"hit_lon_{rule}"] = self.hit_lon[r]
             cols[f"hit_lat_{rule}"] = self.hit_lat[r]
-        cols["other_days"] = self.other_days
-        cols["other_landmass"] = names[self.other_landmass]
-        cols["other_group"] = groups[self.other_landmass]
-        cols["other_lon"] = self.other_lon
-        cols["other_lat"] = self.other_lat
+        n = self.voyage_id.size
+        voyage = pd.Index(self.voyage_id).get_indexer(self.other_voyage_id)
+        order = np.lexsort((self.other_days, voyage))
+        _, first = np.unique(voyage[order], return_index=True)
+        rows = order[first]
+        at = voyage[rows]
+        for name in ("other_days", "other_lon", "other_lat"):
+            cols[name] = np.full(n, np.nan)
+            cols[name][at] = getattr(self, name)[rows]
+        landmass = np.full(n, -1)
+        landmass[at] = self.other_landmass[rows]
+        cols["other_landmass"] = names[landmass]
+        cols["other_group"] = groups[landmass]
+        cols["n_other"] = np.bincount(voyage, minlength=n)
         return pd.DataFrame(cols)
+
+    def other_frame(self) -> pd.DataFrame:
+        """One row per voyage and other group sighted: ``voyage_id``, ``days``, ``landmass``,
+        ``group``, ``lon``, ``lat``, ``exact`` (see the class docstring)."""
+        names = np.array(self.landmass_names, dtype=object)
+        groups = np.array(self.landmass_groups, dtype=object)
+        return pd.DataFrame({"voyage_id": self.other_voyage_id, "days": self.other_days,
+                             "landmass": names[self.other_landmass], "group": groups[self.other_landmass],
+                             "lon": self.other_lon, "lat": self.other_lat, "exact": self.other_exact})
 
     def save(self, path):
         """Write an ``.npz`` at exactly ``path``: the arrays, plus names and meta as JSON.
@@ -238,7 +276,8 @@ class VoyageResults:
     @classmethod
     def load(cls, path) -> VoyageResults:
         """Read results written by ``save``."""
-        with np.load(path, allow_pickle=False) as z:
+        # Opened here, so a file that is not a whole .npz is still closed when np.load fails on it.
+        with open(path, "rb") as fh, np.load(fh, allow_pickle=False) as z:
             arrays = {name: z[name] for name in _ARRAYS}
             has_tracks = "tracks" in z.files
             tracks = z["tracks"] if has_tracks else None
@@ -300,10 +339,13 @@ class _Run:
         self.hit_lon = np.full((n_rules, n), np.nan)
         self.hit_lat = np.full((n_rules, n), np.nan)
         self.armed = np.zeros((n_rules, n), dtype=bool)
-        self.other_days = np.full(n, np.nan)
-        self.other_landmass = np.full(n, -1, dtype=np.int64)
-        self.other_lon = np.full(n, np.nan)
-        self.other_lat = np.full(n, np.nan)
+        # The closest a heading may come to the wind after steering error and wind shifts.
+        self.min_twa_deg = float(strategy.closest_twa_deg(vessel))
+        # Coast segments: one continent, so a voyage leaving any of them is at home along all.
+        kinds = np.array([lm.kind for lm in detector.landmasses])
+        self.coast_groups = np.isin(np.arange(len(detector.groups)), detector.landmass_group[kinds == "coast"])
+        self.other_seen = np.zeros((n, len(detector.groups)), dtype=bool)   # groups recorded as other land
+        self.other_rows = []   # (voyage index, days, landmass, lon, lat, exact) arrays, per step
         self.n_wind_capped = 0
         self.state = strategy.init_state(n)
         self.tracks, self.track_steps = [], []
@@ -342,8 +384,7 @@ class _Run:
         heading = self._strategy_call(self.strategy.heading, idx,
                                       self._context(idx, t, wind_u - cur_u, wind_v - cur_v))
         if cfg.heading_sd_deg > 0 and self.vessel.can_sail:
-            sd = cfg.heading_sd_deg * np.sqrt(_STEERING_HOURS / cfg.dt_hours)
-            heading = heading + sd * noise.normal(cfg.seed, self.ids[idx], k, CH_HEADING)
+            heading = heading + self._steering_error(idx, k)
         walk_u, walk_v = self._random_walk(idx, k)
         u, v = self._ground_velocity(idx, heading, forcing)
         u, v = u + walk_u, v + walk_v
@@ -388,16 +429,25 @@ class _Run:
         # Other land is looked for only on the way to a destination under rule 0: past it a voyage
         # sails on just for the other rules, so what it saw there would depend on which rules share
         # the run. Voyages still looking are active for rule 0 above, which has updated their arming.
-        looking = unsighted[0] & np.isnan(self.other_days[idx])
-        seen, other_frac, other_landmass, _ = self.detector.check_segment(
-            lon0, lat0, lon1, lat1, origin, armed[0], looking, eligible=~dest, rules=[0])
-        other_days = (self.steps_at_sea[idx] + other_frac[0]) * self.dt_days
-        # Not after a destination sighted in this step either; a NaN frac (none) compares False.
-        j = np.flatnonzero(seen[0] & (other_days <= self.cfg.max_days_at_sea) & ~(other_frac[0] >= frac[0]))
-        cols = idx[j]
-        self.other_days[cols] = other_days[j]
-        self.other_landmass[cols] = other_landmass[0, j]
-        self.other_lon[cols], self.other_lat[cols] = _along(lon0[j], lat0[j], lon1[j], lat1[j], other_frac[0, j])
+        # Each pass finds the first sighting of a group not yet recorded; a voyage that recorded one
+        # is searched again for the next, so every group that comes into sight in the step counts.
+        home = np.zeros((idx.size, len(self.detector.groups)), dtype=bool)
+        home[origin >= 0, origin[origin >= 0]] = True
+        home[self.coast_groups[origin] & (origin >= 0)] |= self.coast_groups
+        eligible = ~dest & ~self.other_seen[idx]
+        j = np.flatnonzero(unsighted[0])
+        while j.size:
+            seen, f, landmass, _, exact = self.detector.check_segment(
+                lon0[j], lat0[j], lon1[j], lat1[j], home[j], armed[0, j], True, eligible=eligible[j], rules=[0],
+                return_exact=True)
+            days = (self.steps_at_sea[idx[j]] + f[0]) * self.dt_days
+            # Not after a destination sighted in this step either; a NaN frac (none) compares False.
+            new = seen[0] & (days <= self.cfg.max_days_at_sea) & ~(f[0] >= frac[0, j])
+            j, f, landmass, exact, days = j[new], f[0, new], landmass[0, new], exact[0, new], days[new]
+            self.other_rows.append((idx[j], days, landmass, *_along(lon0[j], lat0[j], lon1[j], lat1[j], f), exact))
+            group = self.detector.landmass_group[landmass]
+            eligible[j, group] = False
+            self.other_seen[idx[j], group] = True
 
     # --- helpers --------------------------------------------------------------
 
@@ -430,12 +480,20 @@ class _Run:
                 *(np.broadcast_to(x, ok.shape)[ok] for x in rest))
 
     def _ground_velocity(self, idx, heading, forcing):
-        """Water velocity on ``heading`` (kept out of the no-go cone) plus the current."""
+        """Water velocity on ``heading`` (kept out of the strategy's no-go cone) plus the current."""
         wind_u, wind_v, cur_u, cur_v = forcing
         rel_u, rel_v = wind_u - cur_u, wind_v - cur_v
-        heading, _ = steer_toward(heading, geo.wind_from_deg(rel_u, rel_v), self.vessel.min_twa_deg, 0, 0.0)
+        heading, _ = steer_toward(heading, geo.wind_from_deg(rel_u, rel_v), self.min_twa_deg, 0, 0.0)
         u, v, _ = self.vessel.water_velocity(heading, rel_u, rel_v, self.cw_sign[idx], self.speed_factor[idx])
         return u + cur_u, v + cur_v
+
+    def _steering_error(self, idx, k):
+        """Steering error (deg) in step ``k``: one draw per 6-hour block since launch, shared by the
+        shorter steps within it; a longer step steers the mean of its blocks' errors."""
+        cfg = self.cfg
+        block = int(np.floor(k * cfg.dt_hours / _STEERING_HOURS + _STEP_TOL))
+        sd = cfg.heading_sd_deg * np.sqrt(min(1.0, _STEERING_HOURS / cfg.dt_hours))
+        return sd * noise.normal(cfg.seed, self.ids[idx], block, CH_HEADING)
 
     def _random_walk(self, idx, k):
         """Random-walk velocity: a displacement of sqrt(2 K dt) sd per axis, spread over the step."""
@@ -485,12 +543,17 @@ class _Run:
             "wind_cap_ms": self.env.wind_cap_ms,
             "n_wind_capped": self.n_wind_capped,
         }
+        voyage, days, landmass, lon, lat, exact = (np.concatenate(x) for x in zip(
+            (np.zeros(0, np.int64), np.zeros(0), np.zeros(0, np.int64), np.zeros(0), np.zeros(0), np.zeros(0, bool)),
+            *self.other_rows))
+        order = np.lexsort((landmass, days, voyage))   # by voyage, then days
         return VoyageResults(
             voyage_id=self.ids.copy(), launch_t=self.launches.t0.copy(), depart_t=self.depart_t,
             end_t=self.end_t, end_lon=self.lon, end_lat=self.lat, days_at_sea=self.steps_at_sea * self.dt_days,
             status=self.status, hit_days=self.hit_days, hit_landmass=self.hit_landmass, hit_lon=self.hit_lon,
-            hit_lat=self.hit_lat, other_days=self.other_days, other_landmass=self.other_landmass,
-            other_lon=self.other_lon, other_lat=self.other_lat, rule_names=list(det.rule_names),
+            hit_lat=self.hit_lat, other_voyage_id=self.ids[voyage[order]], other_days=days[order],
+            other_landmass=landmass[order], other_lon=lon[order], other_lat=lat[order], other_exact=exact[order],
+            rule_names=list(det.rule_names),
             landmass_names=list(det.landmass_names),
             landmass_groups=[det.groups[g] for g in det.landmass_group], group_names=list(det.groups),
             tracks=np.stack(self.tracks, axis=1) if has_tracks else None,
@@ -524,10 +587,20 @@ def _jsonable(x):
 
 
 def _write_npz(path, arrays):
-    """Like ``np.savez_compressed``, but with fixed member timestamps so equal arrays give equal bytes."""
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name, arr in arrays.items():
-            info = zipfile.ZipInfo(f"{name}.npy", date_time=(1980, 1, 1, 0, 0, 0))
-            info.compress_type = zipfile.ZIP_DEFLATED
-            with zf.open(info, "w", force_zip64=True) as fh:
-                np.lib.format.write_array(fh, np.asanyarray(arr), allow_pickle=False)
+    """Like ``np.savez_compressed``, but with fixed member timestamps so equal arrays give equal bytes.
+
+    The file is written under a temporary name and renamed into place, so an
+    interrupted write leaves any earlier file whole.
+    """
+    path = Path(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, arr in arrays.items():
+                info = zipfile.ZipInfo(f"{name}.npy", date_time=(1980, 1, 1, 0, 0, 0))
+                info.compress_type = zipfile.ZIP_DEFLATED
+                with zf.open(info, "w", force_zip64=True) as fh:
+                    np.lib.format.write_array(fh, np.asanyarray(arr), allow_pickle=False)
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)

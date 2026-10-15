@@ -41,7 +41,10 @@
 # coast:
 #   piece_deg: 0.1               # latitude band of one coast piece (default 0.1)
 #   relief_csv: coast_relief.csv # per-band relief, relative to this file; rows are piece_deg bands
-#   relief_column: max5          # which column is the piece height (default max5: highest within 5 km)
+#   relief_column: max5          # which column is the piece height (default max5: highest within 5 km);
+#                                # with the matching lon column (lon5), where that high point lies
+#   relief_near_km: 10           # shoreline runs of a band farther than this from its high point (a gulf's
+#                                # open coast) take a nearby band's relief instead (default 10)
 #   relief_source: "..."
 #   islet_drop_km: 15            # an island lying wholly this close to the continental coast is dropped
 #   island_join_km: 150          # other islands with a shoreline point this close join the coast segment

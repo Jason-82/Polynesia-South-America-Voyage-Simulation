@@ -11,7 +11,11 @@ GSHHG level-1 shorelines (the land/ocean boundary):
   Pacific coast. It is cut into coast segments by latitude and each segment
   into 0.1 deg latitude pieces, whose height is the highest ground within 5 km
   of the shore (``configs/coast_relief.csv``, Copernicus GLO-90); bands without
-  relief data take the segment's height.
+  relief data take the segment's height. Where a gulf or fjord cuts a band
+  (Guayaquil, Reloncavi), that high point can lie on the inner shore, 100 km
+  and more from the open coast: shoreline runs of the band farther than
+  ``relief_near_km`` from it take the relief of the nearest band whose high
+  point lies within that distance of them, as a piece of their own.
 - Polygons listed in the config's ``drop_ids`` are left out: phantom copies
   of islands that GSHHG holds twice, from two source databases.
 - Every other polygon is an island. One inside a group's box belongs to that
@@ -217,12 +221,13 @@ def _load_config(path):
     cfg["groups"] = groups
 
     coast = _fields(cfg["coast"], "coast", ("segments", "placeholder"), piece_deg=0.1, relief_csv=None,
-                    relief_column="max5", relief_source="", islet_drop_km=15.0, island_join_km=150.0,
-                    island_height_m=50.0, island_source="", islands=())
-    for key in ("piece_deg", "islet_drop_km", "island_join_km", "island_height_m"):
+                    relief_column="max5", relief_source="", relief_near_km=10.0, islet_drop_km=15.0,
+                    island_join_km=150.0, island_height_m=50.0, island_source="", islands=())
+    for key in ("piece_deg", "relief_near_km", "islet_drop_km", "island_join_km", "island_height_m"):
         coast[key] = float(coast[key])
-    if not (coast["piece_deg"] > 0 and 0 <= coast["islet_drop_km"] <= coast["island_join_km"]):
-        raise ValueError("coast: need piece_deg > 0 and 0 <= islet_drop_km <= island_join_km")
+    if not (coast["piece_deg"] > 0 and coast["relief_near_km"] > 0
+            and 0 <= coast["islet_drop_km"] <= coast["island_join_km"]):
+        raise ValueError("coast: need piece_deg > 0, relief_near_km > 0 and 0 <= islet_drop_km <= island_join_km")
     segments = []
     for k, s in enumerate(coast["segments"]):
         s = _fields(s, f"coast segment #{k}", ("name", "region", "north", "south"), height_m=None, source="")
@@ -244,13 +249,17 @@ def _load_config(path):
             raise ValueError(f"duplicate {what} names {dupes}")
 
     cfg["relief_path"] = None
-    cfg["relief"] = {}
+    cfg["relief"], cfg["relief_lon"] = {}, {}
     if coast["relief_csv"] is not None:
         cfg["relief_path"] = Path(path).parent / coast["relief_csv"]
         table = pd.read_csv(cfg["relief_path"], comment="#")
         keep = table[coast["relief_column"]].notna().to_numpy()
         bands = _band(table["lat"].to_numpy()[keep], coast["piece_deg"])
         cfg["relief"] = dict(zip(bands.tolist(), table[coast["relief_column"]].to_numpy(float)[keep]))
+        # Where each band's high point lies (max5 -> lon5), when the table says.
+        lon_column = coast["relief_column"].replace("max", "lon", 1)
+        if lon_column in table.columns:
+            cfg["relief_lon"] = dict(zip(bands.tolist(), table[lon_column].to_numpy(float)[keep]))
     cfg["coast"] = coast
     return cfg
 
@@ -371,6 +380,41 @@ def _lat_label(lat):
     return f"{abs(lat):.2f}{'S' if lat < 0 else 'N'}"
 
 
+def _lon_km(run, lon):
+    """East-west distance (km) from a shoreline run's nearest vertex to the meridian ``lon``."""
+    return float(np.min(np.abs(geo.angle_diff(run[:, 0], lon)) * _KM_PER_DEG * np.cos(np.radians(run[:, 1]))))
+
+
+_RELIEF_SEARCH_BANDS = 5   # how many bands north and south to look for a run's relief
+
+
+def _relief_of_runs(runs, band, cfg):
+    """Which band's relief each shoreline run of ``band`` takes.
+
+    A band's high point (``relief_lon``) is within 5 km of some shore of it, but
+    where a gulf or fjord cuts the band that can be the inner shore, far from
+    the open coast. A run within ``relief_near_km`` of its band's high point
+    takes the band's relief. One farther takes the relief of the nearest band
+    (ties: the higher) whose high point lies that close to it, among the
+    ``_RELIEF_SEARCH_BANDS`` on either side; failing that, of the band whose
+    high point is nearest to it.
+    """
+    relief, where, near_km = cfg["relief"], cfg["relief_lon"], cfg["coast"]["relief_near_km"]
+    if band not in where:
+        return [band] * len(runs)
+    bands = [b for b in range(band - _RELIEF_SEARCH_BANDS, band + _RELIEF_SEARCH_BANDS + 1) if b in where]
+    out = []
+    for run in runs:
+        km = {b: _lon_km(run, where[b]) for b in bands}
+        if km[band] <= near_km:
+            out.append(band)
+        elif close := [b for b in bands if km[b] <= near_km]:
+            out.append(min(close, key=lambda b: (abs(b - band), -relief[b])))
+        else:
+            out.append(min(bands, key=lambda b: (km[b], abs(b - band))))
+    return out
+
+
 def _coast_pieces(lines, cfg):
     """Cut coast polylines into pieces by segment and latitude band -> {segment: [Landmass]} north to south."""
     coast, relief = cfg["coast"], cfg["relief"]
@@ -392,15 +436,24 @@ def _coast_pieces(lines, cfg):
         if seg is None:   # a gap between segments
             continue
         band = int(_band(0.5 * (lo + hi), piece))
-        if band in relief:
-            height, source = relief[band], coast["relief_source"]
-        elif seg["height_m"] is not None:
-            height, source = seg["height_m"], seg["source"]
-        else:
-            raise ValueError(f"{seg['name']}: no relief data for {_lat_label(hi)}-{_lat_label(lo)} "
-                             "and no segment height_m")
-        out[seg["name"]].append(Landmass(f"{seg['name']} {_lat_label(hi)}-{_lat_label(lo)}", seg["name"],
-                                         height, parts[b], kind="coast", source=source))
+        name = f"{seg['name']} {_lat_label(hi)}-{_lat_label(lo)}"
+        if band not in relief:
+            if seg["height_m"] is None:
+                raise ValueError(f"{seg['name']}: no relief data for {_lat_label(hi)}-{_lat_label(lo)} "
+                                 "and no segment height_m")
+            out[seg["name"]].append(Landmass(name, seg["name"], seg["height_m"], parts[b], kind="coast",
+                                             source=seg["source"]))
+            continue
+        sources = _relief_of_runs(parts[b], band, cfg)
+        for source in sorted(set(sources), key=lambda x: (x != band, -x)):   # the band's own relief first
+            runs = [run for run, x in zip(parts[b], sources) if x == source]
+            if source == band:
+                out[seg["name"]].append(Landmass(name, seg["name"], relief[band], runs, kind="coast",
+                                                 source=coast["relief_source"]))
+            else:
+                label = _lat_label((source + 0.5) * piece)
+                out[seg["name"]].append(Landmass(f"{name} (relief at {label})", seg["name"], relief[source], runs,
+                                                 kind="coast", source=f"{coast['relief_source']} (band at {label})"))
     return out
 
 

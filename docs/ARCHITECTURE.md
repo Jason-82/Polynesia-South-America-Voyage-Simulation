@@ -163,6 +163,10 @@ class StepContext:
 class Strategy:
     name: str
     max_wait_days: float = 0.0        # >0 only for wait-for-wind
+    def closest_twa_deg(self, vessel) -> float
+        # The closest angle to the wind the rule ever sails this vessel at (default
+        # vessel.min_twa_deg; downwind: max(vessel, its own)). The simulator keeps
+        # steering error and midpoint wind shifts outside this cone too.
     def init_state(self, n) -> dict[str, np.ndarray]
     def ready_to_depart(self, state, ctx) -> np.ndarray[bool]   # default: all True
     def heading(self, state, ctx) -> np.ndarray[float]
@@ -236,18 +240,22 @@ class LandfallDetector:
     def __init__(self, landmasses, rasters, substep_km=2.0)
     groups: list[str]; landmass_group: np.ndarray[int]   # landmass index -> group index
     def check_segment(self, lon0, lat0, lon1, lat1, origin_group, armed, active,
-                      eligible=None, rules=None):
-        # -> (hit, frac, landmass, armed_new), each shaped (len(rules), n).
-        # eligible: optional (n, n_groups) bool; a sighting counts only for groups
-        # the voyage may land on (its destinations). rules: raster indices to
-        # check (default all).
+                      eligible=None, rules=None, return_exact=False):
+        # -> (hit, frac, landmass, armed_new), each shaped (len(rules), n);
+        # with return_exact also exact: False where the sighting was placed where
+        # the land took over from other land in sight that does not count (it came
+        # into sight earlier; see the single-index limitation in the docstring).
+        # origin_group: (n,) home group index (-1 none), or an (n, n_groups) bool
+        # mask of home groups. eligible: optional (n, n_groups) bool; a sighting
+        # counts only for groups the voyage may land on (its destinations).
+        # rules: raster indices to check (default all).
         # Swept-path test: a segment is skipped only if
         #   min(margin_start, margin_end) > 0.75 * length + raster cell size,
         # which guarantees no sighting along it; otherwise it is sampled every
         # substep_km and the first sighting is located by linear interpolation
         # of the margin between samples. frac in [0, 1] is where along the
         # segment land first came into sight.
-        # Home exclusion: sightings of the voyage's origin group are ignored
+        # Home exclusion: sightings of the voyage's home groups are ignored
         # until the voyage has once been out of sight of all land (armed).
 
 def circle_ring(lon, lat, radius_km, n=64) -> np.ndarray      # test / placeholder geometry
@@ -272,9 +280,12 @@ def build_catalog(config_path, gshhg_dir=None, cache_dir=None) -> Catalog
     # one island or atoll (motu) are merged into one landmass; ocean islands get
     # their group from region boxes in the config; the continental Pacific shore
     # (inside a Pacific mask) is cut into 0.1 deg latitude pieces whose height
-    # is the coastal relief within 5 km (configs/coast_relief.csv). Named islands
-    # carry literature heights; others take their group's default (atolls:
-    # trees, about 18 m). Without GSHHG: placeholder circles from the config.
+    # is the coastal relief within 5 km (configs/coast_relief.csv); where a gulf
+    # puts a band's high point on an inner shore, runs of the band more than
+    # relief_near_km (10) from it take a nearby band's relief, as their own
+    # piece "<band> (relief at <lat>)". Named islands carry literature heights;
+    # others take their group's default (atolls: trees, about 18 m). Without
+    # GSHHG: placeholder circles from the config.
 ```
 
 ### `simulate.py`: the integrator
@@ -289,8 +300,12 @@ class Launches:
     target_lon, target_lat: np.ndarray   # NaN if no target
     dest_groups: np.ndarray | None = None
         # (n, n_groups) bool: the groups whose sighting ends the voyage (SPEC:
-        # the far side; home for a return leg). None = any group but home.
-        # Land of other groups is recorded once, under rule 0, as other_*.
+        # the far side; home for a return leg). None = every group, home
+        # included once the voyage has been out of sight of all land.
+        # Land of other groups is recorded under rule 0 as other_*, the first
+        # sighting of each group before a destination. For that record, home is
+        # the origin group, or for a voyage leaving any coast segment every coast
+        # segment (one continent); it counts once the voyage is armed.
 
 @dataclass
 class SimConfig:
@@ -298,9 +313,11 @@ class SimConfig:
     max_days_at_sea: float = 90.0   # horizon; shorter supply limits are applied afterwards
     integrator: str = "midpoint"    # "midpoint" (RK2) | "euler"
     speed_sd: float = 0.10          # per-voyage speed factor ~ N(1, sd), floored at 0.3
-    heading_sd_deg: float = 10.0    # steering error per 6-hour step; scaled by
-                                    # sqrt(6 / dt_hours) so the spread it causes
-                                    # does not depend on the time step
+    heading_sd_deg: float = 10.0    # steering error: one draw per voyage per 6-hour
+                                    # block since launch, shared by shorter steps; a
+                                    # longer step takes the mean of its blocks (sd
+                                    # scaled by sqrt(6 / dt_hours)). So neither the
+                                    # spread nor the cone's clipping depends on dt
     diffusivity_m2s: float = 0.0    # random-walk dispersion K: step sd = sqrt(2 K dt) per axis
     track_every: int = 4            # record a position every N steps (0 = none)
     seed: int = 0
@@ -317,7 +334,8 @@ One step, per voyage (SPEC "Model design"):
    strategy says so; give up (`DID_NOT_SAIL`) after `max_wait_days`. Waiting
    does not use supplies.
 2. **At sea**: read wind and current; wind relative to water = wind − current;
-   the strategy picks a heading; add steering error; velocity over ground =
+   the strategy picks a heading; add steering error, kept out of the
+   strategy's no-go cone (`closest_twa_deg`); velocity over ground =
    vessel's water velocity + current (+ random-walk term). Midpoint
    integration re-reads the fields at the half step with the same heading.
 3. **Land in sight?** Swept-segment test for every sighting rule not yet
@@ -336,13 +354,17 @@ counts.
 class VoyageResults:
     voyage_id, launch_t, depart_t, end_t, end_lon, end_lat, days_at_sea, status
     hit_days, hit_landmass, hit_lon, hit_lat     # (n_rules, n); NaN / -1 when no sighting
-    other_days, other_landmass, other_lon, other_lat   # (n,) first non-destination land, rule 0
+    other_voyage_id, other_days, other_landmass, other_lon, other_lat, other_exact
+        # (m,) rows, one per voyage and non-destination group: its first sighting
+        # under rule 0 before a destination, by voyage then days; other_exact False
+        # where placed at a take-over from other land in sight (came into sight earlier)
     rule_names, landmass_names, landmass_groups, group_names
     tracks: np.ndarray | None                    # (n, n_rec, 2) float32 lon/lat
     track_days: np.ndarray | None                # (n_rec,) days since launch
     current_is_climatology: bool
     meta: dict                                   # config echo, vessel, strategy, seed, version
-    def to_frame(self) -> pd.DataFrame
+    def to_frame(self) -> pd.DataFrame          # one row per voyage (first other land, n_other)
+    def other_frame(self) -> pd.DataFrame       # one row per other-land sighting
     def save(self, path) / load(cls, path)       # .npz + JSON meta
 ```
 
@@ -369,6 +391,8 @@ def cluster_bootstrap(success, clusters, n_boot=2000, seed=0, level=0.95) -> dic
     # Resample clusters (July-June launch years) with replacement; ratio of sums;
     # percentile interval. Returns p, lo, hi, n, n_clusters.
 def duration_summary(days) -> dict            # median, p90, n
+def launch_labels(results, phases=None, index=None, source=None) -> pd.DataFrame
+    # voyage_id, month, enso, enso_source (which index labels the month), year, index, event
 def summarize(results, labels, rules, supplies, dest_groups, by) -> pd.DataFrame
 # Planned (milestone 3): round_trip(out, back, rule, supply_days, min_stay_days,
 # max_wait_days, home_groups) pairing outbound landfalls with return legs.
@@ -405,7 +429,22 @@ def fetch_enso_indices(out_dir, dry_run=False)      # CPC RONI and ONI, PSL HadI
 `voyage-sim run configs/<grid>.yaml` builds everything from the config, runs
 each cell, and writes `outputs/<name>/`: one results `.npz` per cell, a
 `summary.csv` of success probabilities and durations, and the resolved
-config. Rerunning gives byte-identical files. A config names the environment
+config, each under a temporary name and then renamed. Rerunning gives
+byte-identical files, in any process.
+
+- Voyage ids are `cell_key(name) * ID_STRIDE + launch index` (`cell_key`: 32
+  bits of SHA-256 of the cell's name; clashing names are refused), so a cell's
+  voyages do not depend on its position in the config or the other cells.
+- A cell's `meta["run"]` holds every setting its voyages depend on, including
+  `catalog.digest`, a hash of the landmasses (`landmass_digest`); summary.csv
+  leaves out cells made with other settings, or whose `.npz` is unreadable.
+- Before the slow steps, run() checks the data files cover every batch, that a
+  configured `catalog.gshhg_dir` holds the shapefile (no silent placeholder),
+  the ENSO index files, and that the output directory is writable.
+- ENSO labels: `analysis.enso_index` (CPC RONI or ONI, label source `cpc`),
+  and optionally `analysis.enso_index_early` (PSL HadISST Niño-3.4, re-centred
+  on 1991-2020, `hadisst`) for the months before it. With `enso` in
+  `analysis.by`, the summary also groups by `enso_source`. A config names the environment
 (synthetic fields, or ERA5/GLORYS files), the catalog, sighting rules, vessels,
 strategies, departures and targets from `configs/places.yaml`, the launch
 schedule, the simulation settings and the analysis settings.

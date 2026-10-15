@@ -9,16 +9,21 @@ named by the config, sails every cell of the grid and writes
   setting the voyages depend on;
 - ``summary.csv``: success odds with year-bootstrap intervals and days at
   sea, per cell, sighting rule, supply limit and label (launch month; ENSO
-  phase when an index file is configured);
+  phase when an index file is configured, with ``enso_source`` saying which
+  index labelled it: ``cpc`` for RONI or ONI, ``hadisst`` for the HadISST
+  Nino 3.4 anomaly that labels the months before them, the 1940s);
 - ``resolved_config.yaml``: the config with every default filled in.
 
-The config schema is documented at the top of ``configs/synthetic_demo.yaml``.
+Files are written under a temporary name and then renamed, so an
+interrupted run leaves no half-written file. The config schema is documented
+at the top of ``configs/synthetic_demo.yaml``.
 
-Every cell launches the same schedule. A voyage's id is its cell's index
-times ``ID_STRIDE`` plus its launch's index in the schedule, so ids never
-collide across cells; since every random draw is keyed by id, a voyage's
-track does not depend on how launches are batched or which cells run with it,
-and reruns give byte-identical files.
+Every cell launches the same schedule. A voyage's id is a 32-bit key from its
+cell's name (``cell_key``) times ``ID_STRIDE`` plus its launch's index in the
+schedule, so ids never collide across cells (two names with one key are
+refused). Every random draw is keyed by id, so a voyage's track does not
+depend on how launches are batched, which cells run with it or where its cell
+sits in the config, and reruns give byte-identical files.
 
 Launches sail in time-ordered batches. File-based winds and currents are read
 one batch window at a time (a launch month, plus the longest wait in port and
@@ -30,8 +35,11 @@ winds with the monthly current climatology instead: their results are flagged
 ``climatology``.
 
 ``summary.csv`` covers every cell of the config whose ``.npz`` is in the
-output directory and was made with the current settings, so a grid can be run
-a few cells at a time (``--cells``).
+output directory, readable, and made with the current settings, land
+included (a digest of the catalog's landmasses), so a grid can be run a few
+cells at a time (``--cells``). Everything a run needs (data files, the GSHHG
+shorelines when ``gshhg_dir`` names them, ENSO index files, a writable output
+directory) is checked before the slow steps.
 """
 
 from __future__ import annotations
@@ -47,6 +55,7 @@ import logging
 import os
 import re
 import sys
+import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
@@ -77,8 +86,8 @@ from voyage_sim.vessels import Vessel, load_vessels
 
 log = logging.getLogger(__name__)
 
-ID_STRIDE = 1_000_000_000      # voyage id = cell index * ID_STRIDE + launch index
-LABELS = ("month", "enso", "year", "currents")   # label columns analysis.by may group by
+ID_STRIDE = 1_000_000_000      # voyage id = cell_key(name) * ID_STRIDE + launch index (fits int64)
+LABELS = ("month", "enso", "enso_source", "year", "currents")   # label columns analysis.by may group by
 CELL_COLUMNS = ("cell", "departure", "target", "vessel", "strategy")   # lead columns of summary.csv
 _TARGETED = ("hold_course", "wait_for_wind", "latitude")   # strategies that steer for a target
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")      # cell and rule names: safe as file names
@@ -349,15 +358,20 @@ def load_config(path) -> dict:
     SimConfig(**cfg["sim"])   # checks the values
 
     analysis = _keys(cfg["analysis"], "analysis", (), supplies=[30, 60, 90, 120], by=["month"], n_boot=2000,
-                     enso_index=None)
+                     enso_index=None, enso_index_early=None)
     analysis["supplies"] = _float_list(analysis["supplies"], "analysis.supplies")
     analysis["by"] = [analysis["by"]] if isinstance(analysis["by"], str) else list(analysis["by"])
     if unknown := set(analysis["by"]) - set(LABELS):
         raise ValueError(f"analysis.by: unknown labels {sorted(unknown)}; choose from {LABELS}")
-    _path(analysis["enso_index"], "analysis.enso_index", optional=True)
-    if "enso" in analysis["by"] and analysis["enso_index"] is None:
+    for key in ("enso_index", "enso_index_early"):
+        _path(analysis[key], f"analysis.{key}", optional=True)
+    if {"enso", "enso_source"} & set(analysis["by"]) and analysis["enso_index"] is None:
         raise ValueError("analysis.by has enso but no enso_index file is configured")
+    if analysis["enso_index_early"] is not None and analysis["enso_index"] is None:
+        raise ValueError("analysis.enso_index_early labels the months before analysis.enso_index; configure both")
     analysis["n_boot"] = _number(analysis["n_boot"], "analysis.n_boot", int)
+    if analysis["n_boot"] < 1:
+        raise ValueError(f"analysis.n_boot must be at least 1, got {analysis['n_boot']}")
     cfg["analysis"] = analysis
 
     if not isinstance(cfg["cells"], list) or not cfg["cells"]:
@@ -479,6 +493,9 @@ class _FileSeries:
         times, files, steps = [], [], []
         for k, path in enumerate(self.paths):
             with xr.open_dataset(path) as ds:
+                if missing := [name for name in (self.u, self.v) if name not in ds.data_vars]:
+                    raise ValueError(f"{what}: {path} has no variable {missing[0]!r}; it has {sorted(ds.data_vars)} "
+                                     f"(set environment.{what}.u and .v)")
                 t = geo.to_epoch_hours(ds[_dim(ds[self.u], _TIME_NAMES)].values)
             times.append(t)
             files.append(np.full(t.size, k))
@@ -506,16 +523,32 @@ class _FileSeries:
         return sel
 
     def window(self, t0, t1) -> GriddedField:
-        """The data over ``span(t0, t1)``."""
+        """The data over ``span(t0, t1)``.
+
+        Each file's part is normalized (ascending latitude) and copied into one
+        array per component, allocated once, so reading takes about the
+        window's size plus one file's part (a window of hourly winds is GBs).
+        """
         sel = self.span(t0, t1)
-        pieces = []
+        u = v = lon = lat = None
+        times, at = [], 0
         for k in dict.fromkeys(self.file[sel].tolist()):   # files in time order
+            steps = self.step[sel][self.file[sel] == k]
             with xr.open_dataset(self.paths[k]) as ds:
                 t_dim = _dim(ds[self.u], _TIME_NAMES)
-                pieces.append(ds[[self.u, self.v]].isel({t_dim: self.step[sel][self.file[sel] == k]}).load())
-        ds = pieces[0] if len(pieces) == 1 else xr.concat(
-            pieces, dim=t_dim, data_vars="minimal", coords="minimal", compat="override", join="exact")
-        return GriddedField.from_dataset(ds, self.u, self.v, name=self.what)
+                part = GriddedField.from_dataset(ds[[self.u, self.v]].isel({t_dim: steps}), self.u, self.v)
+            if u is None:
+                lon, lat = part.lon, part.lat
+                u = np.empty((sel.size,) + part.u.shape[1:], dtype=part.u.dtype)
+                v = np.empty_like(u)
+            elif not (np.array_equal(part.lon, lon) and np.array_equal(part.lat, lat)):
+                raise ValueError(f"{self.what}: {self.paths[k]} is on another grid than the files before it")
+            n = part.u.shape[0]
+            u[at:at + n], v[at:at + n] = part.u, part.v
+            times.append(part.time)
+            at += n
+            del part
+        return GriddedField(lon, lat, np.concatenate(times), u, v, name=self.what)
 
 
 def _load_climatology(path, u, v) -> MonthlyClimatologyField:
@@ -535,17 +568,25 @@ def _load_climatology(path, u, v) -> MonthlyClimatologyField:
 
 # --- land and cells -----------------------------------------------------------------
 
-def _raster(landmasses, rule, raster_cfg, cache_dir) -> SightingRaster:
-    """The rule's sighting raster, from the cache when the landmasses, rule, settings and code match."""
+def landmass_digest(landmasses) -> str:
+    """SHA-256 of all a voyage sees of the land: every landmass's name, group, kind, height and shoreline."""
+    h = hashlib.sha256()
+    for lm in landmasses:
+        h.update(json.dumps([lm.name, lm.group, lm.kind, lm.height_m, [len(r) for r in lm.rings]]).encode())
+        for ring in lm.rings:
+            h.update(np.ascontiguousarray(ring, dtype=np.float64).tobytes())
+    return h.hexdigest()
+
+
+def _raster(landmasses, rule, raster_cfg, cache_dir, digest=None) -> SightingRaster:
+    """The rule's sighting raster, from the cache when the landmasses (``digest``, computed if not
+    given), rule, settings and code match."""
     build = {key: raster_cfg[key] for key in ("bounds", "res_deg", "densify_km", "cap_km")}
     path = None
     if cache_dir is not None:
         h = hashlib.sha256(Path(landfall.__file__).read_bytes())
         h.update(json.dumps([dataclasses.asdict(rule), build], sort_keys=True).encode())
-        for lm in landmasses:
-            h.update(json.dumps([lm.name, lm.group, lm.kind, lm.height_m]).encode())
-            for ring in lm.rings:
-                h.update(np.ascontiguousarray(ring, dtype=np.float64).tobytes())
+        h.update((digest or landmass_digest(landmasses)).encode())
         path = cache_dir / f"raster-{rule.name}-{h.hexdigest()[:20]}.npz"
         if path.is_file():
             return SightingRaster.load(path)
@@ -559,11 +600,16 @@ def _raster(landmasses, rule, raster_cfg, cache_dir) -> SightingRaster:
     return raster
 
 
+def cell_key(name) -> int:
+    """A cell's 32-bit key, from its name; part of every voyage id, so of every random draw."""
+    return int.from_bytes(hashlib.sha256(str(name).encode("utf-8")).digest()[:4], "big")
+
+
 @dataclass
 class Cell:
     """One cell of the grid, resolved against the vessels, places and catalog."""
 
-    index: int                 # position in the config; part of every voyage id
+    key: int                   # cell_key(name); part of every voyage id
     name: str
     vessel: Vessel
     strategy: Strategy
@@ -577,36 +623,57 @@ class Cell:
     def launches(self, idx, t) -> Launches:
         """Launches number ``idx`` of the schedule, at epoch hours ``t``."""
         target = self.target or {"lon": np.nan, "lat": np.nan}
-        return Launches(self.index * ID_STRIDE + np.asarray(idx, dtype=np.int64), self.departure["lon"],
+        return Launches(self.key * ID_STRIDE + np.asarray(idx, dtype=np.int64), self.departure["lon"],
                         self.departure["lat"], t, self.origin_group, target["lon"], target["lat"],
                         dest_groups=self.dest_groups)
 
 
 def _yaml(path):
     with open(path, encoding="utf-8") as fh:
-        return yaml.safe_load(fh)
+        try:
+            return yaml.safe_load(fh)
+        except yaml.YAMLError as err:
+            raise ValueError(f"{path} is not valid YAML: {err}") from err
 
 
-def _place(entry):
-    return None if entry is None else {key: entry[key] for key in ("name", "lon", "lat", "group")}
+def _place(entry, what):
+    """A place's name, lon, lat and group, checked."""
+    if entry is None:
+        return None
+    if missing := [key for key in ("name", "lon", "lat", "group") if key not in entry]:
+        raise ValueError(f"{what}: no {', '.join(missing)}")
+    return {"name": entry["name"], "lon": _number(entry["lon"], f"{what}: lon"),
+            "lat": _number(entry["lat"], f"{what}: lat"), "group": entry["group"]}
 
 
-def resolve_cells(cfg, base, cat, groups) -> list[Cell]:
+def resolve_cells(cfg, base, cat, groups, digest=None) -> list[Cell]:
     """The config's cells with their vessels, strategies, places and destination groups.
 
     ``groups`` are the detector's group names, in its order. A cell's ``spec``
-    holds its settings from the config, its places and its vessel's entry in
-    the vessels file.
+    holds its settings from the config, its places, its vessel's entry in the
+    vessels file and a digest of the catalog's landmasses (``digest``,
+    computed if not given), but not its position in the config.
     """
     vessels_path = _resolve(base, cfg["vessels"])
     vessels, vessel_entries = load_vessels(vessels_path), _yaml(vessels_path)["vessels"]
-    places_doc = _yaml(_resolve(base, cfg["places"]))
-    places = {kind: {p["name"]: p for p in places_doc.get(kind) or []} for kind in ("departures", "targets")}
+    places_path = _resolve(base, cfg["places"])
+    places_doc = _yaml(places_path)
+    places = {}
+    for kind in ("departures", "targets"):
+        entries = (places_doc or {}).get(kind) or []
+        if not all(isinstance(p, Mapping) and "name" in p for p in entries):
+            raise ValueError(f"{places_path}: every entry of {kind} needs a name")
+        places[kind] = {p["name"]: p for p in entries}
     # Where the cache lives changes no voyage, so moving it leaves earlier results valid.
     shared = {key: cfg[key] for key in ("seed", "environment", "rules", "raster", "launches", "sim")}
     shared["catalog"] = {key: value for key, value in cfg["catalog"].items() if key != "cache_dir"}
+    shared["catalog"]["digest"] = digest or landmass_digest(cat.landmasses)
+    keys = {}
+    for c in cfg["cells"]:
+        if (other := keys.setdefault(cell_key(c["name"]), c["name"])) != c["name"]:
+            raise ValueError(f"cells {other!r} and {c['name']!r} have the same id key; rename one")
     cells = []
-    for k, c in enumerate(cfg["cells"]):
+    for c in cfg["cells"]:
         what = f"cell {c['name']!r}"
         lookups = (("departure", "departures", places["departures"]), ("target", "targets", places["targets"]),
                    ("vessel", "vessels", vessels))
@@ -619,17 +686,17 @@ def resolve_cells(cfg, base, cat, groups) -> list[Cell]:
             raise ValueError(f"{what}: drift craft only drift, and sailing vessels never do")
         if strategy.name in _TARGETED and c["target"] is None:
             raise ValueError(f"{what}: strategy {strategy.name} needs a target")
-        departure = _place(places["departures"][c["departure"]])
-        target = _place(places["targets"].get(c["target"]))
+        departure = _place(places["departures"][c["departure"]], f"{places_path}: departure {c['departure']!r}")
+        target = _place(places["targets"].get(c["target"]), f"{places_path}: target {c['target']!r}")
         dest = list(dict.fromkeys(cat.groups_in(*c["destinations"]["regions"]) + c["destinations"]["groups"]))
         if not dest:
             raise ValueError(f"{what}: its destination regions hold no catalog group")
         for group in [departure["group"], *dest]:
             if group not in groups:
                 raise ValueError(f"{what}: no group {group!r} in the catalog")
-        spec = {"cell": c, "index": k, "departure": departure, "target": target, "dest_groups": dest,
+        spec = {"cell": c, "departure": departure, "target": target, "dest_groups": dest,
                 "vessel": vessel_entries[c["vessel"]], **shared}
-        cells.append(Cell(k, c["name"], vessel, strategy,
+        cells.append(Cell(cell_key(c["name"]), c["name"], vessel, strategy,
                           SimConfig(**cfg["sim"], max_days_at_sea=c["max_days_at_sea"], seed=cfg["seed"]),
                           departure, target, groups.index(departure["group"]), np.isin(groups, dest),
                           json.loads(json.dumps(spec))))
@@ -685,6 +752,7 @@ def sail(cells, source, times, detector) -> list[VoyageResults]:
     for b, (idx, t0, t1) in enumerate(batches):
         t = times[idx]
         log.info("batch %d/%d: launches %s to %s", b + 1, len(batches), _iso(t[0]), _iso(t[-1]))
+        env = None   # let the last batch's fields go before the next are read
         env = source.window(t0, t1)
         for cell, acc in zip(cells, parts):
             acc.append(simulate(env, cell.vessel, cell.strategy, cell.launches(idx, t), detector, cell.sim))
@@ -706,26 +774,75 @@ def _currents(env, launch_t) -> np.ndarray:
     return np.where(np.asarray(launch_t) < _climatology_before(env), "climatology", "reanalysis").astype(object)
 
 
-def summary_table(cfg, base, cells, out) -> pd.DataFrame:
-    """Summary rows of every cell whose results in ``out`` were made with the current settings."""
+def enso_labels(cfg, base, times=None) -> tuple[pd.Series, pd.Series, pd.Series] | None:
+    """ENSO ``(phases, index, source)`` by month from the analysis section's index files; None without one.
+
+    ``analysis.enso_index`` is a CPC seasonal file (RONI or ONI); its months
+    are labelled ``cpc``. ``analysis.enso_index_early``, a PSL HadISST Nino 3.4
+    anomaly file, labels the months before it (SPEC: the 1940s), re-centred on
+    1991-2020 and averaged over three months first; those are ``hadisst``.
+    Raises if a file holds no index values, or none for the launch ``times``;
+    logs how many launches no index labels.
+    """
     analysis = cfg["analysis"]
-    phases = index = None
-    if analysis["enso_index"] is not None:
-        index = enso.parse_cpc_seasonal(_resolve(base, analysis["enso_index"]).read_text(encoding="latin-1"))
-        phases = enso.enso_phases(index)
+    if analysis["enso_index"] is None:
+        return None
+
+    def read(key, parse):
+        path = _resolve(base, analysis[key])
+        series = parse(path.read_text(encoding="latin-1")).dropna()
+        if series.empty:
+            raise ValueError(f"analysis.{key}: no index values in {path}")
+        return series
+
+    index = read("enso_index", enso.parse_cpc_seasonal)
+    phases = enso.enso_phases(index)
+    source = pd.Series("cpc", index=phases.index, dtype=object)
+    if analysis["enso_index_early"] is not None:
+        early = enso.running_mean_3(enso.recentre(read("enso_index_early", enso.parse_psl_monthly))).dropna()
+        early_phases = enso.enso_phases(early)
+        before = early_phases.index < phases.index[0]
+        phases = pd.concat([early_phases[before], phases])
+        source = pd.concat([pd.Series("hadisst", index=early_phases.index[before], dtype=object), source])
+        index = pd.concat([early[early.index < index.index[0]], index])
+    if times is not None and len(times):
+        labelled = enso.label_times(times, phases) != enso.UNKNOWN
+        if not labelled.any():
+            raise ValueError(f"analysis.enso_index: the index covers {phases.index[0]} to {phases.index[-1]}; "
+                             f"the launches run {_iso(times[0])} to {_iso(times[-1])}")
+        if not labelled.all():
+            log.warning("no ENSO index labels %d of %d launches (from %s); their label is unknown",
+                        np.count_nonzero(~labelled), labelled.size, _iso(times[~labelled][0]))
+    return phases, index, source
+
+
+def summary_table(cfg, base, cells, out, enso_months=None) -> pd.DataFrame:
+    """Summary rows of every cell whose results in ``out`` are readable and were made with the current
+    settings. ``enso_months`` is ``enso_labels``'s result (read from the config if not given)."""
+    analysis = cfg["analysis"]
+    phases = index = source = None
+    if (enso_months := enso_months or enso_labels(cfg, base)) is not None:
+        phases, index, source = enso_months
+    by = list(analysis["by"])
+    if "enso" in by and "enso_source" not in by:
+        by.insert(by.index("enso") + 1, "enso_source")   # flags labels from a different index
     frames = []
     for cell in cells:
         path = out / f"{cell.name}.npz"
         if not path.is_file():
             continue
-        results = VoyageResults.load(path)
+        try:
+            results = VoyageResults.load(path)
+        except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile) as err:
+            log.warning("%s is unreadable (%s); rerun its cell to summarize it", path, err)
+            continue
         if results.meta.get("run") != cell.spec:
             log.warning("%s was made with other settings; rerun its cell to summarize it", path)
             continue
-        labels = analyze.launch_labels(results, phases, index)
+        labels = analyze.launch_labels(results, phases, index, source)
         labels["currents"] = _currents(cfg["environment"], results.launch_t)
         supplies = [s for s in analysis["supplies"] if s <= cell.sim.max_days_at_sea]
-        df = analyze.summarize(results, labels, results.rule_names, supplies, by=analysis["by"],
+        df = analyze.summarize(results, labels, results.rule_names, supplies, by=by,
                                n_boot=analysis["n_boot"], seed=cfg["seed"])
         lead = (cell.name, cell.departure["name"], cell.target["name"] if cell.target else None,
                 cell.vessel.name, cell.strategy.name)
@@ -750,29 +867,58 @@ def run(config_path, out_dir=None, cells=None) -> Path:
 
     cat_cfg = cfg["catalog"]
     cache_dir = None if cat_cfg["cache_dir"] is None else _resolve(base, cat_cfg["cache_dir"])
-    cat = catalog.build_catalog(_resolve(base, cat_cfg["config"]),
-                                None if cat_cfg["gshhg_dir"] is None else _resolve(base, cat_cfg["gshhg_dir"]),
-                                cache_dir)
+    gshhg_dir = None
+    if cat_cfg["gshhg_dir"] is not None:
+        gshhg_dir = _resolve(base, cat_cfg["gshhg_dir"])
+        if not (gshhg_dir / catalog.GSHHG_SHAPEFILE).is_file():
+            # The library falls back to the placeholder catalog; a grid asked for real shorelines.
+            raise ValueError(f"catalog.gshhg_dir: no GSHHG shapefile at {gshhg_dir / catalog.GSHHG_SHAPEFILE} "
+                             "(voyage-sim fetch gshhg); set gshhg_dir: null for the placeholder catalog")
+    cat = catalog.build_catalog(_resolve(base, cat_cfg["config"]), gshhg_dir, cache_dir)
+    digest = landmass_digest(cat.landmasses)
     groups = list(dict.fromkeys(lm.group for lm in cat.landmasses))   # numbered as the detector numbers them
-    every = resolve_cells(cfg, base, cat, groups)
+    every = resolve_cells(cfg, base, cat, groups, digest)
     chosen = [c for c in every if cells is None or fnmatch.fnmatchcase(c.name, cells)]
     if not chosen:
         raise ValueError(f"no cell name matches {cells!r}; cells are {[c.name for c in every]}")
     times = launch_times(cfg["launches"])
+    # Everything the run needs is checked before the slow steps.
     for _, t0, t1 in batch_windows(chosen, source, times):
-        source.check(t0, t1)   # every batch's data are there, before the slow steps
+        source.check(t0, t1)
+    enso_months = enso_labels(cfg, base, times)
+    _writable(out)
 
-    rasters = [_raster(cat.landmasses, SightingRule(**rule), cfg["raster"], cache_dir) for rule in cfg["rules"]]
+    rasters = [_raster(cat.landmasses, SightingRule(**rule), cfg["raster"], cache_dir, digest) for rule in cfg["rules"]]
     detector = LandfallDetector(cat.landmasses, rasters, substep_km=cfg["raster"]["substep_km"])
     results = sail(chosen, source, times, detector)
-    out.mkdir(parents=True, exist_ok=True)
     for cell, res in zip(chosen, results):
         res.save(out / f"{cell.name}.npz")
-    with open(out / "resolved_config.yaml", "w", encoding="utf-8") as fh:
-        yaml.safe_dump({**cfg, "version": __version__}, fh, sort_keys=True, allow_unicode=True)
-    summary_table(cfg, base, every, out).to_csv(out / "summary.csv", index=False, float_format="%.6g",
-                                            lineterminator="\n")
+    _write_text(out / "resolved_config.yaml",
+                yaml.safe_dump({**cfg, "version": __version__}, sort_keys=True, allow_unicode=True))
+    summary = summary_table(cfg, base, every, out, enso_months)
+    _write_text(out / "summary.csv", summary.to_csv(index=False, float_format="%.6g", lineterminator="\n"))
     return out
+
+
+def _writable(out):
+    """Create the output directory and check that files can be written in it."""
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        probe = out / f".write-test.{os.getpid()}"
+        probe.touch()
+        probe.unlink()
+    except OSError as err:
+        raise ValueError(f"cannot write outputs to {out}: {err}") from err
+
+
+def _write_text(path, text):
+    """Write a text file under a temporary name, then rename it into place."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # --- command line ---------------------------------------------------------------------
@@ -782,7 +928,13 @@ def _ints(text) -> list[int]:
     values = []
     for part in text.split(","):
         lo, _, hi = part.partition("-")
-        values += range(int(lo), int(hi or lo) + 1)
+        try:
+            lo, hi = int(lo), int(hi or lo)
+        except ValueError:
+            raise ValueError(f"bad number or range {part!r} in {text!r}") from None
+        if hi < lo:
+            raise ValueError(f"bad range {part!r}: it ends before it starts")
+        values += range(lo, hi + 1)
     return values
 
 
@@ -838,7 +990,7 @@ def main(argv=None) -> int:
             print(run(args.config, args.out, args.cells))
         else:
             _fetch(args)
-    except (ValueError, FileNotFoundError) as err:
+    except (ValueError, OSError) as err:   # bad settings or files: a message, not a traceback
         print(f"voyage-sim: error: {err}", file=sys.stderr)
         return 1
     return 0

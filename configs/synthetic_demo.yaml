@@ -31,7 +31,7 @@
 #   wind_cap_ms: 50
 # catalog:
 #   config: landmasses.yaml   # land: groups, regions, heights (voyage_sim.catalog)
-#   gshhg_dir: null           # unpacked GSHHG shorelines; null: the placeholder catalog
+#   gshhg_dir: null           # unpacked GSHHG shorelines (an error if missing); null: the placeholder catalog
 #   cache_dir: null           # catalog and sighting rasters are cached here (null: no cache)
 # rules:                      # sighting rules (voyage_sim.landfall.SightingRule); the first is
 #   - {name: main, mode: height, bird_km: 37}   # the main rule, under which other land is recorded
@@ -60,11 +60,15 @@
 #   track_every: 4            # record positions every N steps (0: no tracks)
 # analysis:
 #   supplies: [30, 60, 90, 120]   # supply limits (days); a cell uses those within its horizon
-#   by: [month]               # summary rows per value of these labels: month, enso, year (July-June,
-#                             # the bootstrap cluster), currents (synthetic, reanalysis or climatology)
-#   n_boot: 2000              # bootstrap replicates (resampling July-June launch years)
+#   by: [month]               # summary rows per value of these labels: month, enso (with enso_source,
+#                             # the index that labels it: cpc or hadisst), year (July-June, the
+#                             # bootstrap cluster), currents (synthetic, reanalysis or climatology)
+#   n_boot: 2000              # bootstrap replicates (resampling July-June launch years), at least 1
 #   enso_index: null          # CPC RONI/ONI text file (voyage-sim fetch enso); needed for by: enso
-# cells:                      # one run each; names are file names and --cells globs
+#   enso_index_early: null    # PSL HadISST Nino 3.4 file (nino34.long.anom.data): labels the months
+#                             # before enso_index starts (the 1940s), re-centred on 1991-2020
+# cells:                      # one run each; names are file names and --cells globs, and key the
+#                             # cell's random draws (renaming a cell changes its voyages; moving it does not)
 #   - name: fatuhiva_canoe75_hold
 #     departure: Fatu Hiva    # a departure in places.yaml; home is its group
 #     target: Manta           # a target in places.yaml, or null (drift, downwind need none)

@@ -1,4 +1,5 @@
 import dataclasses
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -63,11 +64,24 @@ def take(lau, idx):
     return Launches(**{name: x if x is None else x[idx] for name, x in values.items()})
 
 
+def others(res):
+    """Other-land rows by voyage id: {id: [(days, landmass, lon, lat, exact), ...]}, in record order."""
+    rows = {}
+    for v, *row in zip(*(getattr(res, f"other_{name}").tolist()
+                         for name in ("voyage_id", "days", "landmass", "lon", "lat", "exact"))):
+        rows.setdefault(v, []).append(tuple(row))
+    return rows
+
+
 def assert_same(a, b, idx=slice(None)):
     """Every per-voyage output of ``a`` equals ``b`` at voyages ``idx`` of ``b``."""
-    for name in ("voyage_id", "depart_t", "end_t", "end_lon", "end_lat", "days_at_sea", "status",
-                 "other_days", "other_landmass", "other_lon", "other_lat"):
+    for name in ("voyage_id", "depart_t", "end_t", "end_lon", "end_lat", "days_at_sea", "status"):
         np.testing.assert_array_equal(getattr(a, name), getattr(b, name)[idx], err_msg=name)
+    rows_a, rows_b = others(a), others(b)
+    assert {v: rows_a.get(v, []) for v in a.voyage_id} == {v: rows_b.get(v, []) for v in a.voyage_id}
+    # Rows run voyage by voyage, in the voyages' order.
+    order = pd.Index(a.voyage_id).get_indexer(a.other_voyage_id)
+    assert np.all(np.diff(order) >= 0)
     for name in ("hit_days", "hit_landmass", "hit_lon", "hit_lat"):
         np.testing.assert_array_equal(getattr(a, name), getattr(b, name)[:, idx], err_msg=name)
     # ``b`` may run longer (other voyages still at sea): past its end a track holds its final position.
@@ -346,10 +360,27 @@ def test_home_island_counts_only_after_it_has_dropped_out_of_sight():
     legs = simulate(env, RAFT, Drift(), launches(lon=launch_lon, origin=0, dest=[[True, False], [False, True]], n=2),
                     det, SimConfig(max_days_at_sea=10.0, **QUIET))
     assert legs.hit_days[0, 0] == res.hit_days[0, 0] and legs.hit_landmass[0, 0] == 0
-    assert np.isnan(legs.other_days[0]) and legs.other_landmass[0] == -1
     assert np.isnan(legs.hit_days[0, 1]) and legs.status[1] == END_HORIZON
-    assert legs.other_days[1] == res.hit_days[0, 0] and legs.other_landmass[1] == 0
-    assert legs.other_lon[1] == res.hit_lon[0, 0] and legs.other_lat[1] == 0.0
+    assert others(legs) == {1: [(res.hit_days[0, 0], 0, res.hit_lon[0, 0], 0.0, True)]}
+
+
+def test_home_stays_armed_from_one_step_to_the_next():
+    # A return leg (home its destination) out past a neighbour whose 30 km zone overlaps home's, and back.
+    # Coming back, the raft is in sight of the neighbour at every step boundary until home takes over, so
+    # home counts only because the voyage was armed steps earlier, beyond the neighbour.
+    det = detector([Landmass("Home", "Home", 100.0, [circle_ring(START, 0.0, 3.0)]),
+                    Landmass("Next", "Next", 0.0, [circle_ring(east(START, -60.0), 0.0, 3.0)])], radii=(30.0,))
+    turn = T0 + 60.0
+    env = Environment(UniformField(0.0, 0.0),
+                      FunctionField(lambda lon, lat, t: (np.where(t < turn, -0.6, 0.6), 0.0)))
+    km_per_day = 0.6 * 86.4
+    furthest = 10.0 + 2.5 * km_per_day
+    for dt in (6.0, 1.0):
+        res = simulate(env, RAFT, Drift(), launches(lon=east(START, -10.0), origin=0, dest=[True, False]), det,
+                       SimConfig(dt_hours=dt, max_days_at_sea=8.0, **QUIET))
+        # Home takes over from the neighbour halfway between them, 30 km from home's centre (to a raster cell).
+        assert res.status[0] == END_ALL_SIGHTED and res.hit_landmass[0, 0] == 0, dt
+        assert res.hit_days[0, 0] == pytest.approx(2.5 + (furthest - 30.0) / km_per_day, abs=6.0 / km_per_day)
 
 
 def test_only_destinations_end_a_voyage_and_other_land_is_recorded_on_the_way():
@@ -365,21 +396,22 @@ def test_only_destinations_end_a_voyage_and_other_land_is_recorded_on_the_way():
     anywhere = simulate(CURRENT_EAST, RAFT, Drift(), launches(), det, cfg)
     np.testing.assert_array_equal(anywhere.hit_landmass[:, 0], [0, 1])
     assert anywhere.hit_days[0, 0] == pytest.approx(reef_km / KM_PER_DAY, abs=0.01)
-    assert np.isnan(anywhere.other_days[0]) and anywhere.other_landmass[0] == -1
+    assert anywhere.other_voyage_id.size == 0
 
     # Bound for Isle: Reef is sailed past and recorded; bound for Reef: Isle comes after the
-    # destination under u40, so it is not land on the way; bound nowhere: only the first other land.
+    # destination under u40, so it is not land on the way; bound nowhere: both are other land.
     dest = np.array([[False, True], [True, False], [False, False]])
     res = simulate(CURRENT_EAST, RAFT, Drift(), launches(dest=dest, n=3), det, cfg)
     np.testing.assert_array_equal(res.hit_landmass, [[1, 0, -1], [1, -1, -1]])
     np.testing.assert_allclose(res.hit_days[:, 0], np.array([360.0, 380.0]) / KM_PER_DAY, atol=1e-4)
     assert res.hit_days[0, 1] == anywhere.hit_days[0, 0] and np.isnan(res.hit_days[1, 1])
     np.testing.assert_array_equal(res.status, [END_ALL_SIGHTED, END_HORIZON, END_HORIZON])
-    np.testing.assert_array_equal(res.other_landmass, [0, -1, 0])
-    np.testing.assert_allclose(res.other_days[[0, 2]], reef_km / KM_PER_DAY, atol=0.01)
-    assert np.isnan(res.other_days[1]) and res.other_days[0] == res.other_days[2]
-    np.testing.assert_allclose(res.other_lon[[0, 2]], east(START, reef_km), atol=0.01)
-    assert np.all(res.other_lat[[0, 2]] == 0.0) and np.isnan(res.other_lon[1])
+    np.testing.assert_array_equal(res.other_voyage_id, [0, 2, 2])
+    np.testing.assert_array_equal(res.other_landmass, [0, 0, 1])
+    np.testing.assert_allclose(res.other_days, np.array([reef_km, reef_km, 360.0]) / KM_PER_DAY, atol=0.01)
+    assert res.other_days[0] == res.other_days[1] and res.other_days[2] == res.hit_days[0, 0]
+    np.testing.assert_allclose(res.other_lon, east(START, np.array([reef_km, reef_km, 360.0])), atol=0.01)
+    assert np.all(res.other_lat == 0.0) and res.other_exact.all()
     # Destinations do not change tracks, and each voyage's outcome is its own.
     assert np.all(res.end_lon[1:] == res.end_lon[1])
     assert_same(simulate(CURRENT_EAST, RAFT, Drift(), take(launches(dest=dest, n=3), [2]), det, cfg), res, [2])
@@ -395,30 +427,123 @@ def test_only_destinations_end_a_voyage_and_other_land_is_recorded_on_the_way():
     np.testing.assert_array_equal(res.hit_landmass[0], [0, 1])
     assert res.hit_days[0, 0] == pytest.approx(north_km / KM_PER_DAY, abs=0.01)
     assert res.hit_days[0, 1] == pytest.approx(122.0 / KM_PER_DAY, abs=3.5 / KM_PER_DAY)
-    np.testing.assert_array_equal(res.other_landmass, [-1, 0])
-    assert np.isnan(res.other_days[0]) and res.other_days[1] == res.hit_days[0, 0]
+    np.testing.assert_array_equal(res.other_voyage_id, [1])
+    assert res.other_landmass[0] == 0 and res.other_days[0] == res.hit_days[0, 0]
 
 
-def test_other_land_is_what_the_complementary_destinations_would_sight_first():
-    # Tracks do not depend on destinations, so a voyage's first other land is the first rule-0
-    # sighting of a run bound for every other group, whenever that comes before its destination.
+def test_other_land_is_what_runs_bound_for_each_other_group_would_sight():
+    # Tracks do not depend on destinations, so a voyage's other land is, group by group, the rule-0
+    # sighting of a run bound for that group alone, whenever that comes before its destination; and
+    # the first of it is the first sighting of a run bound for every other group.
     rng = np.random.default_rng(0)
     isles = [point(f"I{i}", lon, lat, group=f"G{i % 4}")
-             for i, (lon, lat) in enumerate(zip(rng.uniform(-148.5, -143.0, 10), rng.uniform(-2.5, 2.5, 10)))]
+             for i, (lon, lat) in enumerate(zip(rng.uniform(-148.5, -143.0, 12), rng.uniform(-2.5, 2.5, 12)))]
     det = detector(isles, radii=(40.0, 20.0))
-    dest = rng.random((60, 4)) < 0.4
+    dest = rng.random((60, 4)) < 0.25
     lau = launches(lat=np.linspace(-3.0, 3.0, 60), dest=dest)
     env = Environment(UniformField(0.0, 0.0), FunctionField(eddies))
     cfg = SimConfig(max_days_at_sea=15.0, diffusivity_m2s=300.0, track_every=0)
     res = simulate(env, RAFT, Drift(), lau, det, cfg)
+    arrival = np.where(np.isnan(res.hit_days[0]), np.inf, res.hit_days[0])
+
     rest = simulate(env, RAFT, Drift(), dataclasses.replace(lau, dest_groups=~dest), det, cfg)
     first = rest.hit_days[0]
-    before = first < np.where(np.isnan(res.hit_days[0]), np.inf, res.hit_days[0])
+    before = first < arrival
     assert before.sum() >= 10 and (np.isfinite(first) & ~before).sum() >= 3   # both cases occur
-    np.testing.assert_array_equal(res.other_days, np.where(before, first, np.nan))
-    np.testing.assert_array_equal(res.other_landmass, np.where(before, rest.hit_landmass[0], -1))
-    np.testing.assert_array_equal(res.other_lon, np.where(before, rest.hit_lon[0], np.nan))
-    np.testing.assert_array_equal(res.other_lat, np.where(before, rest.hit_lat[0], np.nan))
+    df = res.to_frame()
+    np.testing.assert_array_equal(df["other_days"], np.where(before, first, np.nan))
+    names = np.array(det.landmass_names, dtype=object)
+    assert df["other_landmass"].fillna("").tolist() == np.where(before, names[rest.hit_landmass[0]], "").tolist()
+    np.testing.assert_array_equal(df["other_lon"], np.where(before, rest.hit_lon[0], np.nan))
+    np.testing.assert_array_equal(df["other_lat"], np.where(before, rest.hit_lat[0], np.nan))
+
+    expected = {}
+    for g in range(4):
+        alone = simulate(env, RAFT, Drift(), dataclasses.replace(lau, dest_groups=np.eye(4, dtype=bool)[g]), det, cfg)
+        for v in np.flatnonzero(~dest[:, g] & (alone.hit_days[0] < arrival)):
+            expected.setdefault(v, []).append((alone.hit_days[0, v], alone.hit_landmass[0, v],
+                                               alone.hit_lon[0, v], alone.hit_lat[0, v]))
+    got = {v: [row[:4] for row in rows] for v, rows in others(res).items()}
+    assert got == {v: sorted(rows) for v, rows in expected.items()}
+    assert sum(len(rows) > 1 for rows in got.values()) >= 5   # several groups on one voyage
+    np.testing.assert_array_equal(df["n_other"], [len(got.get(v, [])) for v in range(60)])
+
+
+def test_coast_beside_the_port_is_home_and_offshore_land_on_the_way_is_recorded():
+    # A port 5.5 km north of where one coast segment meets the next, both in sight at departure; the
+    # current sets west-southwest, past an offshore island 6 days out, to a destination 12 days out.
+    north = Landmass("North coast", "Coast: North", 100.0, [np.array([[-138.0, 3.9], [-138.0, 0.0]])], kind="coast")
+    south = Landmass("South coast", "Coast: South", 100.0, [np.array([[-138.0, 0.0], [-138.0, -3.9]])], kind="coast")
+    u, v = -0.5, -0.2
+    speed_km = np.hypot(u, v) * 86.4
+
+    def track(days):
+        return east(-138.0, -11.0 + u * 86.4 * days), (5.5 + v * 86.4 * days) / KM_PER_DEG
+
+    det = detector([north, south, point("Isle", *track(6.0), group="Offshore"), point("Far", *track(12.0))])
+    assert det.groups == ["Coast: North", "Coast: South", "Offshore", "Far"]
+    lau = launches(lon=track(0.0)[0], lat=track(0.0)[1], origin=0, dest=[False, False, False, True])
+    res = simulate(Environment(UniformField(0.0, 0.0), UniformField(u, v)), RAFT, Drift(), lau, det,
+                   SimConfig(max_days_at_sea=15.0, **QUIET))
+    # The neighbouring segment of the home coast is not land on the way; the island is.
+    assert res.hit_landmass[0, 0] == 3 and res.hit_days[0, 0] == pytest.approx(12.0 - 40.0 / speed_km, abs=0.01)
+    assert [(row[1], row[4]) for row in others(res)[0]] == [(2, True)]
+    assert res.other_days[0] == pytest.approx(6.0 - 40.0 / speed_km, abs=0.01)
+
+    # The home coast counts once the voyage has been out of sight of all land: here the current turns
+    # after two days and brings the raft back, 52 km south of the segment boundary.
+    back = Environment(UniformField(0.0, 0.0),
+                       FunctionField(lambda lon, lat, t: (np.where(t < T0 + 48.0, u, -u), v)))
+    res = simulate(back, RAFT, Drift(), lau, det, SimConfig(max_days_at_sea=5.0, **QUIET))
+    returned = 2.0 + (-11.0 + 2 * u * 86.4 + 40.0) / (u * 86.4)
+    assert [(row[1], row[4]) for row in others(res)[0]] == [(1, True)]
+    assert res.other_days[0] == pytest.approx(returned, abs=0.01)
+
+
+def test_other_land_hidden_behind_unarmed_home_is_flagged_inexact():
+    # Home and its neighbour 60 km east have 40 km zones that overlap: the raster holds home (still in
+    # sight, so not armed) out to the midpoint, where the neighbour first counts. It came into sight
+    # 10 km earlier; the record is that later point, flagged.
+    det = detector([point("Home", START), point("Next", east(START, 60.0)), point("Far", east(START, 600.0))])
+    res = simulate(CURRENT_EAST, RAFT, Drift(), launches(lon=east(START, 10.0), origin=0, dest=[False, False, True]),
+                   det, SimConfig(max_days_at_sea=3.0, **QUIET))
+    assert res.other_landmass.tolist() == [1] and not res.other_exact[0]
+    assert res.other_days[0] == pytest.approx(20.0 / KM_PER_DAY, abs=4.0 / KM_PER_DAY)
+    # Without home in the way, the neighbour is sighted where it comes into sight, exactly.
+    alone = detector([point("Next", east(START, 60.0)), point("Far", east(START, 600.0))])
+    clear = simulate(CURRENT_EAST, RAFT, Drift(), launches(lon=east(START, 10.0), dest=[False, True]), alone,
+                     SimConfig(max_days_at_sea=3.0, **QUIET))
+    assert clear.other_landmass.tolist() == [0] and clear.other_exact[0]
+    assert clear.other_days[0] == pytest.approx(10.0 / KM_PER_DAY, abs=1e-4)
+
+
+def test_downwind_never_sails_closer_than_90_degrees_whatever_the_vessel(monkeypatch):
+    # Target dead upwind in a steady easterly: downwind sails at the 90-degree edge, and steering error
+    # must not carry the upwind canoe (75 degrees) closer, so it sails exactly as the 90-degree canoe.
+    from voyage_sim.strategies import Downwind
+    from voyage_sim.vessels import load_vessels
+
+    vessels = load_vessels(Path(__file__).resolve().parents[1] / "configs" / "vessels.yaml")
+    angles = []
+    water_velocity = Vessel.water_velocity
+
+    def logged(self, heading_deg, wind_u, wind_v, cw_sign, speed_factor=1.0):
+        u, v, sailing = water_velocity(self, heading_deg, wind_u, wind_v, cw_sign, speed_factor)
+        twa = geo.true_wind_angle(heading_deg, geo.wind_from_deg(wind_u, wind_v))
+        angles.append(np.atleast_1d(twa)[np.atleast_1d(sailing)])
+        return u, v, sailing
+
+    monkeypatch.setattr(Vessel, "water_velocity", logged)
+    det = detector([point("Far", east(START, 1500.0))])
+    lau = launches(target=(east(START, 1500.0), 0.0), n=200)
+    easterly = Environment(UniformField(-7.0, 0.0), UniformField(0.0, 0.0))
+    runs = {}
+    for name in ("canoe_75", "canoe_90"):
+        angles.clear()
+        runs[name] = simulate(easterly, vessels[name], Downwind(), lau, det, SimConfig(max_days_at_sea=5.0))
+        sailed = np.concatenate(angles)
+        assert sailed.size > 1000 and sailed.min() >= 90.0 - 1e-6, name
+    np.testing.assert_array_equal(runs["canoe_75"].tracks, runs["canoe_90"].tracks)
 
 
 # --- step size, several rules ------------------------------------------------------
@@ -491,6 +616,23 @@ def test_steering_error_spread_does_not_depend_on_the_time_step():
     assert spread[1.0] == pytest.approx(spread[6.0], rel=0.2)
 
 
+def test_windward_progress_with_steering_error_does_not_depend_on_the_time_step():
+    # A dead beat against a steady wind with the default steering error. The no-go cone clips the errors
+    # that point into the wind; drawn afresh every short step, they would push the mean heading further
+    # off the wind as the step shrinks. One error per 6-hour block keeps the beat the same at any step.
+    det = detector([point("Far", east(START, 1500.0))])
+    lau = launches(target=(east(START, 1500.0), 0.0), n=400)
+    headwind = Environment(UniformField(-6.0, 0.0), UniformField(0.0, 0.0))
+    made_good = {}
+    for dt in (1.0, 2.0, 6.0):
+        res = simulate(headwind, CANOE, HoldCourse(), lau, det,
+                       SimConfig(dt_hours=dt, max_days_at_sea=6.0, speed_sd=0.0, track_every=0))
+        made_good[dt] = (res.end_lon - START).mean() * KM_PER_DEG / 6.0
+    assert made_good[6.0] > 25.0
+    assert made_good[1.0] == pytest.approx(made_good[6.0], rel=0.05)
+    assert made_good[2.0] == pytest.approx(made_good[6.0], rel=0.05)
+
+
 @pytest.mark.parametrize("integrator, samples_per_step", [("euler", 1), ("midpoint", 2)])
 def test_wind_above_the_cap_is_slowed_to_it_keeping_its_direction(target_ahead, integrator, samples_per_step):
     # A spurious 100 m/s wind toward the north-east, capped at 50 m/s: the raft drifts exactly as in
@@ -549,17 +691,41 @@ def test_results_frame_and_save_load(tmp_path, target_ahead):
     assert VoyageResults.load(a).tracks is None
 
     # Bound for Other only: Target, in sight of the first voyage under u20, is other land.
-    assert np.all(np.isnan(res.other_days)) and df["other_landmass"].isna().all()
+    assert res.other_voyage_id.size == 0 and df["other_landmass"].isna().all() and (df["n_other"] == 0).all()
     bound = simulate(CURRENT_EAST, RAFT, Drift(), launches(lat=[0.0, 0.3, 3.0], dest=[False, True]), det,
                      SimConfig(max_days_at_sea=8.0))
     df = bound.to_frame()
     assert df["other_landmass"][0] == "Target" and df["other_group"][0] == "Isles"
     assert df["other_landmass"][1:].isna().all() and df["other_group"][1:].isna().all()
     assert df["other_days"][0] == pytest.approx(280.0 / KM_PER_DAY, abs=1e-4)
-    np.testing.assert_array_equal(df["other_lon"], bound.other_lon)
-    np.testing.assert_array_equal(df["other_lat"], bound.other_lat)
+    assert df["other_lon"][0] == bound.other_lon[0] and df["other_lat"][0] == bound.other_lat[0]
+    assert list(df["n_other"]) == [1, 0, 0]
+    rows = bound.other_frame()
+    assert list(rows.columns) == ["voyage_id", "days", "landmass", "group", "lon", "lat", "exact"]
+    assert rows.to_dict("records") == [{"voyage_id": 0, "days": bound.other_days[0], "landmass": "Target",
+                                        "group": "Isles", "lon": bound.other_lon[0], "lat": 0.0, "exact": True}]
     bound.save(a)
     assert_same(VoyageResults.load(a), bound)
+
+
+def test_an_interrupted_save_leaves_the_earlier_file_whole(tmp_path, target_ahead, monkeypatch):
+    res = simulate(CURRENT_EAST, RAFT, Drift(), launches(n=3), target_ahead, SimConfig(max_days_at_sea=2.0))
+    path = tmp_path / "cell.npz"
+    res.save(path)
+    before = path.read_bytes()
+    write_array = np.lib.format.write_array
+    calls = []
+
+    def killed(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 3:
+            raise KeyboardInterrupt
+        return write_array(*args, **kwargs)
+
+    monkeypatch.setattr(np.lib.format, "write_array", killed)
+    with pytest.raises(KeyboardInterrupt):
+        res.save(path)
+    assert path.read_bytes() == before and [p.name for p in tmp_path.iterdir()] == ["cell.npz"]
 
 
 def test_input_validation(target_ahead):

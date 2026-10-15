@@ -127,6 +127,19 @@ def test_within_year_correlation_widens_the_interval():
     assert 0.7 < w_year / w_iid < 1.4
 
 
+def test_bootstrap_pools_voyages_over_clusters_of_unequal_size():
+    # A ratio of sums over the drawn clusters: one successful voyage alone in its year weighs one voyage of
+    # 901, not a tenth of the sample (as a mean of per-year fractions would make it).
+    s = np.concatenate([[True], np.tile(np.arange(100) < 10, 9)])
+    years = np.concatenate([[0], np.repeat(np.arange(1, 10), 100)])
+    ci = analyze.cluster_bootstrap(s, years, n_boot=4000, seed=0)
+    assert ci["p"] == pytest.approx(91 / 901) and ci["hi"] < 0.11
+    # Exactly the reference resampling, with the same draws.
+    hits, counts = np.bincount(years, weights=s), np.bincount(years).astype(float)
+    draw = np.random.default_rng(0).integers(0, 10, size=(4000, 10))
+    assert (ci["lo"], ci["hi"]) == tuple(np.percentile(hits[draw].sum(1) / counts[draw].sum(1), [2.5, 97.5]))
+
+
 def test_bootstrap_degenerate_inputs():
     one = analyze.cluster_bootstrap([True, False, True], [1999, 1999, 1999])
     assert one["p"] == pytest.approx(2 / 3) and one["n_clusters"] == 1
@@ -227,14 +240,14 @@ def test_summarize_is_deterministic_and_aligns_labels_by_voyage_id():
 
 def test_share_not_sailed_counts_did_not_sail_as_failures():
     res = _results()
-    # Voyages 2 and 5 never left port; neither has a sighting under r20.
-    res.status = np.array([END_ALL_SIGHTED, AT_SEA, DID_NOT_SAIL, AT_SEA, AT_SEA, DID_NOT_SAIL, AT_SEA, AT_SEA])
-    res.hit_days[:, [2, 5]] = NAN
-    res.hit_landmass[:, [2, 5]] = -1
+    # Voyages 1 and 2, both launched in January, never left port: each cell reports its own share.
+    res.status = np.array([END_ALL_SIGHTED, DID_NOT_SAIL, DID_NOT_SAIL, AT_SEA, AT_SEA, AT_SEA, AT_SEA, AT_SEA])
+    res.hit_days[:, [1, 2]] = NAN
+    res.hit_landmass[:, [1, 2]] = -1
     df = analyze.summarize(res, _labels(), rules=["r20"], supplies=[90], by=("month",))
-    assert list(df.share_not_sailed) == [0.25, 0.25]
-    # They stay in the denominator: January has sightings by voyages 0, 1, 3 of 4.
-    assert _row(df, "r20", 90, 1).p == 0.75
+    assert list(df.share_not_sailed) == [0.5, 0.0]
+    # They stay in the denominator: January has sightings by voyages 0 and 3 of 4.
+    assert _row(df, "r20", 90, 1).p == 0.5
 
 
 def test_summarize_without_voyages_gives_an_empty_overall_cell(recwarn):
@@ -263,15 +276,21 @@ def test_launch_labels_from_launch_times():
     phases = _monthly_phases("1997-06", "NEEEEEEEEN")  # El Nino Jul 1997 - Feb 1998
     index = pd.Series([0.3, 0.7, 2.4], index=pd.period_range("1997-06", periods=3, freq="M"))
     lab = analyze.launch_labels(res, phases, index)
-    assert list(lab.columns) == ["voyage_id", "month", "enso", "year", "index", "event"]
+    assert list(lab.columns) == ["voyage_id", "month", "enso", "enso_source", "year", "index", "event"]
+    assert list(lab.enso_source) == ["index", "index", "index", "unknown", "unknown"]
     assert list(lab.voyage_id) == [10, 11, 12, 13, 14]
     assert list(lab.month) == [6, 7, 1, 6, 3]
     assert list(lab.enso) == ["neutral", "el_nino", "el_nino", "unknown", "unknown"]
     assert list(lab.year) == [1996, 1997, 1997, 1997, 2000]
     np.testing.assert_allclose(lab["index"], [0.3, 0.7, NAN, NAN, NAN])
     assert list(lab.event.fillna("-")) == ["-", "el_nino:1997-07", "el_nino:1997-07", "-", "-"]
+    # Labels from two indices are told apart by source.
+    source = pd.Series(["hadisst"] * 4 + ["cpc"] * 6, index=phases.index)
+    assert list(analyze.launch_labels(res, phases, index, source).enso_source) == [
+        "hadisst", "hadisst", "cpc", "unknown", "unknown"]
     bare = analyze.launch_labels(res)
     assert (bare.enso == "unknown").all() and bare["index"].isna().all() and bare.event.isna().all()
+    assert (bare.enso_source == "unknown").all()
     pd.testing.assert_series_equal(bare.year, lab.year)
 
 

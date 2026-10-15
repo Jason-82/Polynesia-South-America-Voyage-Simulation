@@ -1,5 +1,9 @@
+import gc
+import os
 import subprocess
 import sys
+import tracemalloc
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -151,12 +155,31 @@ def test_tiny_grid_summary_is_sane(tiny):
 def test_voyage_ids_are_unique_across_cells(tiny):
     _, out = tiny
     ids = []
-    for k, cell in enumerate(CONFIG["cells"]):
+    for cell in CONFIG["cells"]:
         res = VoyageResults.load(out / f"{cell['name']}.npz")
-        np.testing.assert_array_equal(res.voyage_id, k * run.ID_STRIDE + np.arange(N_LAUNCHES))
+        np.testing.assert_array_equal(res.voyage_id, run.cell_key(cell["name"]) * run.ID_STRIDE + np.arange(N_LAUNCHES))
         assert res.meta["run"]["cell"]["name"] == cell["name"]
         ids.append(res.voyage_id)
     assert np.unique(np.concatenate(ids)).size == len(CONFIG["cells"]) * N_LAUNCHES
+    assert (2**32 - 1) * run.ID_STRIDE + run.ID_STRIDE - 1 < np.iinfo(np.int64).max
+
+
+def test_a_cell_sails_the_same_voyages_wherever_it_sits_in_the_grid(tiny, tmp_path):
+    # Its voyages depend on the cell, not on the cells before it: reordered, or alone in a config of its
+    # own, it gives the same file, so a grid can grow and a cell can be rerun on its own.
+    path, out = tiny
+    for name, cells in (("reordered", CONFIG["cells"][::-1]), ("alone", CONFIG["cells"][2:3])):
+        config = write_world(tmp_path / name, {**CONFIG, "catalog": shared_cache(path), "cells": cells})
+        result = run.run(config, tmp_path / name / "out", cells="puerto_canoe_hold") / "puerto_canoe_hold.npz"
+        assert result.read_bytes() == (out / "puerto_canoe_hold.npz").read_bytes()
+
+
+def test_cells_whose_names_share_an_id_key_are_refused(tiny, monkeypatch):
+    path, _ = tiny
+    monkeypatch.setattr(run, "cell_key", lambda name: 7)
+    with pytest.raises(ValueError, match="same id key"):
+        run.run(path, path.parent / "never")
+    assert not (path.parent / "never").exists()
 
 
 def test_rerun_is_byte_identical(tiny, tmp_path):
@@ -222,6 +245,31 @@ def test_batch_windows_cover_the_longest_wait_and_horizon(tiny, tmp_path, monkey
     assert t1 - np.concatenate(env.current.times).max() <= 2 * dt
 
 
+def test_batch_windows_cover_the_cell_that_reaches_furthest(tiny, tmp_path, monkeypatch):
+    """The window is sized by the cell that sails longest, wherever it comes in the grid."""
+    path, _ = tiny
+    windows = []
+
+    def window(self, t0, t1):
+        env = Environment(Recorder(self.env.wind), Recorder(self.env.current))
+        windows.append((t0, t1, env))
+        return env
+
+    monkeypatch.setattr(run.SyntheticSource, "window", window)
+    monkeypatch.setattr(run.SyntheticSource, "batches", lambda self, times: np.split(np.arange(len(times)), len(times)))
+    short = {**CONFIG["cells"][0], "name": "short_hold", "max_days_at_sea": 2}
+    long = {**CONFIG["cells"][3], "name": "long_drift", "max_days_at_sea": 6}
+    config = {**CONFIG, "catalog": shared_cache(path), "launches": {"start": "2001-06-01", "end": "2001-06-02"},
+              "analysis": {"supplies": [2], "by": []}, "cells": [short, long]}
+    out = run.run(write_world(tmp_path, config), tmp_path / "out")
+    assert len(windows) == 2
+    for t0, t1, env in windows:
+        t = np.concatenate(env.wind.times + env.current.times)
+        assert t0 <= t.min() and t.max() <= t1
+    res = VoyageResults.load(out / "long_drift.npz")
+    assert (res.status == END_HORIZON).all() and (res.days_at_sea == 6.0).all()
+
+
 def test_cells_glob_reruns_some_cells_and_keeps_the_summary(tiny, tmp_path):
     path, out = tiny
     copy_outputs(out, tmp_path)
@@ -237,6 +285,86 @@ def test_results_from_other_settings_are_left_out_of_the_summary(tiny, tmp_path,
     run.run(changed, tmp_path, cells="island_raft_drift")
     assert set(pd.read_csv(tmp_path / "summary.csv")["cell"]) == {"island_raft_drift"}
     assert "puerto_canoe_hold.npz was made with other settings" in caplog.text
+
+
+def test_a_rule_changed_under_the_same_name_gets_its_own_raster(tiny, tmp_path):
+    # A sensitivity rerun (the main rule at half range) must not reuse the cached raster of the old rule.
+    path, out = tiny
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    for cached in (path.parent / "cache").iterdir():
+        (cache / cached.name).write_bytes(cached.read_bytes())
+    rules = [{**CONFIG["rules"][0], "scale": 0.5}, CONFIG["rules"][1]]
+    config = write_world(tmp_path, {**CONFIG, "catalog": {**CONFIG["catalog"], "cache_dir": str(cache)},
+                                    "rules": rules})
+    run.run(config, tmp_path / "out", cells="puerto_raft_drift")
+    assert len(list(cache.glob("raster-main-*.npz"))) == 2 and len(list(cache.glob("raster-uniform40-*.npz"))) == 1
+    old, new = (VoyageResults.load(d / "puerto_raft_drift.npz") for d in (out, tmp_path / "out"))
+    both = np.isfinite(old.hit_days[0]) & np.isfinite(new.hit_days[0])
+    assert both.any() and np.all(new.hit_days[0, both] > old.hit_days[0, both])
+    np.testing.assert_array_equal(new.hit_days[1], old.hit_days[1])
+
+
+def test_results_on_other_land_are_left_out_of_the_summary(tiny, tmp_path, caplog):
+    # The land is part of a result's settings: after a height in the catalog changes, cells made on the
+    # old land are not summarized with those made on the new.
+    path, out = tiny
+    copy_outputs(out, tmp_path / "out")
+    changed = write_world(tmp_path / "changed", {**CONFIG, "catalog": shared_cache(path)})
+    world = tmp_path / "changed" / "world.yaml"
+    world.write_text(WORLD.replace("height_m: 500", "height_m: 300"))
+    run.run(changed, tmp_path / "out", cells="island_raft_drift")
+    assert set(pd.read_csv(tmp_path / "out" / "summary.csv")["cell"]) == {"island_raft_drift"}
+    assert "puerto_canoe_hold.npz was made with other settings" in caplog.text
+    # Back on the old land, the old results stand again (the config records the moved cache).
+    world.write_text(WORLD)
+    run.run(changed, tmp_path / "out", cells="island_raft_drift")
+    again, before = files(tmp_path / "out"), files(out)
+    assert again.pop("resolved_config.yaml") != before.pop("resolved_config.yaml") and again == before
+
+
+def test_a_configured_gshhg_dir_without_shorelines_is_an_error(tiny, tmp_path, capsys):
+    path, _ = tiny
+    (tmp_path / "gshhg").mkdir()
+    config = write_world(tmp_path, {**CONFIG, "catalog": {**shared_cache(path), "gshhg_dir": "gshhg"}})
+    assert run.main(["run", str(config), "--out", str(tmp_path / "out")]) == 1
+    assert "catalog.gshhg_dir: no GSHHG shapefile" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
+def test_unreadable_results_are_left_out_of_the_summary(tiny, tmp_path, caplog):
+    # A cell's file cut short (a run killed while saving it) is reported, not a crash of later runs.
+    path, out = tiny
+    copy_outputs(out, tmp_path)
+    whole = (tmp_path / "puerto_raft_drift.npz").read_bytes()
+    (tmp_path / "puerto_raft_drift.npz").write_bytes(whole[:2000])
+    assert run.main(["run", str(path), "--out", str(tmp_path), "--cells", "island_*"]) == 0
+    assert "puerto_raft_drift.npz is unreadable" in caplog.text
+    assert "puerto_raft_drift" not in set(pd.read_csv(tmp_path / "summary.csv")["cell"])
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_an_unwritable_output_or_a_bad_index_file_stops_the_run_before_it_sails(tiny, tmp_path, capsys, monkeypatch):
+    path, _ = tiny
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("sailed")
+
+    monkeypatch.setattr(run, "sail", refuse)
+    (tmp_path / "a_file").write_text("")
+    for out in (tmp_path / "a_file", tmp_path / "a_file" / "sub"):
+        assert run.main(["run", str(path), "--out", str(out)]) == 1
+        assert f"cannot write outputs to {out}" in capsys.readouterr().err
+
+    analysis = {"supplies": [20], "by": ["enso"], "n_boot": 50, "enso_index": "index.txt"}
+    config = write_world(tmp_path / "enso", {**CONFIG, "catalog": shared_cache(path), "analysis": analysis})
+    for text, message in ((None, "No such file"), ("garbage\n<html>404</html>\n", "no index values in"),
+                          ("SEAS YR ANOM\nDJF 1970 1.2\nJFM 1970 1.1\n", "the index covers 1970-01 to 1970-02")):
+        if text is not None:
+            (tmp_path / "enso" / "index.txt").write_text(text)
+        assert run.main(["run", str(config), "--out", str(tmp_path / "enso" / "out")]) == 1
+        assert message in capsys.readouterr().err
+        assert not (tmp_path / "enso" / "out").exists()
 
 
 SEASONS = ("DJF", "JFM", "FMA", "MAM", "AMJ", "MJJ", "JJA", "JAS", "ASO", "SON", "OND", "NDJ")
@@ -256,8 +384,33 @@ def test_enso_labels_come_from_the_index_file(tiny, tmp_path):
     df = pd.read_csv(tmp_path / "out" / "summary.csv")
     assert set(df["cell"]) == {c["name"] for c in CONFIG["cells"]}   # the cache moved, the results stand
     assert set(df["enso"]) == {"el_nino"} and (df["n_events"] == 1).all()
+    assert set(df["enso_source"]) == {"cpc"}
     # One event, but June and July launches fall in different July-June years: two clusters.
     assert (df["n_years"] == 2).all()
+
+
+def test_the_1940s_take_their_enso_labels_from_hadisst(tiny, tmp_path):
+    # SPEC: before RONI starts (1950), HadISST Nino 3.4 re-centred on 1991-2020 labels the launches,
+    # flagged as a different index. Here an El Nino from 1946 to 1948 in HadISST, neutral after.
+    path, _ = tiny
+    rows = [f"{year} " + " ".join("1.50" if 1946 <= year <= 1948 else "0.00" for _ in range(12))
+            for year in range(1940, 2021)]
+    (tmp_path / "hadisst.data").write_text("\n".join(["1940 2020", *rows, "-99.99", "HadISST1 Nino 3.4"]) + "\n")
+    roni = ["SEAS  YR   ANOM"] + [f"{season} {year} 0.00" for year in range(1950, 2021) for season in SEASONS]
+    (tmp_path / "roni.txt").write_text("\n".join(roni) + "\n")
+    analysis = {"supplies": [20], "by": ["enso"], "n_boot": 50, "enso_index": "roni.txt",
+                "enso_index_early": "hadisst.data"}
+    launches = {"start": "1947-04-28", "end": "1950-12-31", "every_days": 90}
+    config = write_world(tmp_path, {**CONFIG, "catalog": shared_cache(path), "analysis": analysis,
+                                    "launches": launches, "cells": CONFIG["cells"][3:]})
+    df = pd.read_csv(run.run(config, tmp_path / "out") / "summary.csv")
+    n = {(e, s): n for e, s, n in zip(df["enso"], df["enso_source"], df["n"])}
+    # The three-month mean carries the event into January 1949.
+    month = geo.from_epoch_hours(run.launch_times(run.load_config(config)["launches"])).astype("datetime64[M]")
+    jan_1949, jan_1950 = np.datetime64("1949-01"), np.datetime64("1950-01")
+    assert n == {("el_nino", "hadisst"): np.count_nonzero(month <= jan_1949),
+                 ("neutral", "hadisst"): np.count_nonzero((month > jan_1949) & (month < jan_1950)),
+                 ("neutral", "cpc"): np.count_nonzero(month >= jan_1950)}
 
 
 # --- files: ERA5- and GLORYS-like NetCDF ------------------------------------------
@@ -349,6 +502,32 @@ def test_file_windows_pair_early_launches_with_the_climatology(data):
         source.check(times[1], geo.to_epoch_hours("1993-01-31T12"))
 
 
+def test_launches_after_a_mid_month_climatology_cutoff_sail_on_the_reanalysis(tiny, tmp_path):
+    # climatology_before may fall mid-month: the batch splits there, so later launches never sail on the
+    # climatology (whose current is 0.1 m/s weaker) while labelled reanalysis.
+    path, _ = tiny
+    for month in ("1993-01", "1993-02"):
+        era5_month(tmp_path / "era5", month)
+    glorys_days(tmp_path / "glorys" / "glorys_uv_1993.nc", "1993-01-01", "1993-02-28")
+    climatology(tmp_path / "glorys" / "climatology.nc")
+    environment = {**FILES_CONFIG["environment"], "climatology_before": "1993-01-15"}
+    launches = {"start": "1993-01-01", "end": "1993-01-29", "every_days": 7}
+    config = write_world(tmp_path, {**FILES_CONFIG, "environment": environment, "launches": launches,
+                                    "catalog": shared_cache(path)})
+    cfg = run.load_config(config)
+    times = run.launch_times(cfg["launches"])
+    assert [b.tolist() for b in run.make_source(cfg["environment"], tmp_path).batches(times)] == [[0, 1], [2, 3, 4]]
+    mixed = VoyageResults.load(run.run(config, tmp_path / "mixed") / "puerto_raft_drift.npz")
+    no_clim = {key: value for key, value in environment.items() if key != "climatology"}
+    config = write_world(tmp_path, {**FILES_CONFIG, "environment": no_clim, "launches": launches,
+                                    "catalog": shared_cache(path)})
+    reanalysis = VoyageResults.load(run.run(config, tmp_path / "reanalysis") / "puerto_raft_drift.npz")
+    np.testing.assert_array_equal(mixed.end_lon[2:], reanalysis.end_lon[2:])
+    assert np.all(mixed.end_lon[:2] - reanalysis.end_lon[:2] > 1.0)
+    df = pd.read_csv(tmp_path / "mixed" / "summary.csv")
+    assert set(zip(df["currents"], df["n"])) == {("climatology", 2), ("reanalysis", 3)}
+
+
 def test_a_missing_file_is_found_before_sailing(data):
     era5_month(data.parent / "era5", "1993-02")
     (data.parent / "era5" / "era5_uv10_1993-01.nc").unlink()
@@ -391,6 +570,50 @@ def test_monthly_file_windows_give_the_results_of_one_batch(tiny, tmp_path, monk
     assert set(zip(df["month"], df["currents"], df["n"])) == {(1, "reanalysis", 5), (2, "reanalysis", 1)}
 
 
+def test_reading_a_window_takes_little_more_memory_than_the_window(tmp_path):
+    # Hourly winds make windows of GBs (SPEC: the time-step test), so a window is read file by file into
+    # one array, not concatenated and then flipped to ascending latitude in further copies.
+    lon, lat = np.arange(-100.0, -69.9, 0.25), np.arange(10.0, -15.1, -0.25)   # ERA5: descending latitude
+    for month in ("2010-01", "2010-02", "2010-03", "2010-04"):
+        start, end = np.datetime64(month, "M"), np.datetime64(month, "M") + np.timedelta64(1, "M")
+        t = np.arange(start.astype("datetime64[h]"), end.astype("datetime64[h]"), np.timedelta64(6, "h"))
+        data = np.random.default_rng(0).normal(size=(t.size, lat.size, lon.size)).astype(np.float32)
+        dims = ("valid_time", "latitude", "longitude")
+        xr.Dataset({"u10": (dims, data), "v10": (dims, -data)},
+                   coords={"valid_time": t.astype("datetime64[ns]"), "latitude": lat, "longitude": lon}
+                   ).to_netcdf(tmp_path / f"era5_{month}.nc")
+    series = run._FileSeries(tmp_path, {"paths": "era5_*.nc", "u": "u10", "v": "v10"}, "wind")
+    tracemalloc.start()
+    try:
+        field = series.window(series.times[0], series.times[-1])
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 1.75 * (field.u.nbytes + field.v.nbytes)
+    np.testing.assert_array_equal(field.lat, lat[::-1])
+    with xr.open_dataset(tmp_path / "era5_2010-03.nc") as ds:
+        k = np.searchsorted(field.time, geo.to_epoch_hours(ds["valid_time"].values[0]))
+        np.testing.assert_array_equal(field.u[k], ds["u10"].values[0, ::-1])
+        np.testing.assert_array_equal(field.v[k], ds["v10"].values[0, ::-1])
+
+
+def test_each_batch_lets_the_last_batch_fields_go_before_reading_its_own(tiny, tmp_path, monkeypatch):
+    path, out = tiny
+    earlier = []
+
+    def window(self, t0, t1):
+        gc.collect()
+        assert all(ref() is None for ref in earlier), "the last batch's fields are still held"
+        env = Environment(self.env.wind, self.env.current, wind_cap_ms=self.env.wind_cap_ms)
+        earlier.append(weakref.ref(env))
+        return env
+
+    monkeypatch.setattr(run.SyntheticSource, "window", window)
+    monkeypatch.setattr(run.SyntheticSource, "batches", lambda self, times: np.array_split(np.arange(len(times)), 3))
+    run.run(path, tmp_path)
+    assert len(earlier) == 3 and files(tmp_path) == files(out)
+
+
 # --- configs and the command line -----------------------------------------------------
 
 # SPEC "Model design": the far side's destinations.
@@ -414,6 +637,9 @@ def test_shipped_configs_resolve_with_the_far_side_as_destination(name):
         assert dest == (COLOMBIA_TO_CENTRAL_CHILE if from_polynesia else EASTERN_POLYNESIA), cell.name
         assert groups[cell.origin_group] == cell.departure["group"]
         assert cell.target is None or cell.target["group"] in dest
+        # The voyages carry those destinations: only they end a voyage (SPEC).
+        np.testing.assert_array_equal(cell.launches(np.arange(2), np.zeros(2)).dest_groups,
+                                      np.broadcast_to(cell.dest_groups, (2, len(groups))))
 
 
 def test_a_single_destination_region_needs_no_list(tmp_path):
@@ -440,6 +666,8 @@ def test_a_single_destination_region_needs_no_list(tmp_path):
      "cells[0].strategy:"),
     ({"environment": {"type": "files", "wind": {"paths": ["a.nc"]}, "current": {"paths": "b.nc"}}},
      "environment.wind.paths must be a path"),
+    ({"analysis": {"n_boot": 0}}, "analysis.n_boot must be at least 1"),
+    ({"analysis": {"enso_index_early": "hadisst.data"}}, "configure both"),
 ])
 def test_bad_configs_fail_with_a_message(tmp_path, capsys, change, message):
     path = write_world(tmp_path, {**CONFIG, **change})
@@ -455,6 +683,21 @@ def test_broken_yaml_fails_with_a_message(tmp_path, capsys):
     assert f"{path} is not valid YAML" in capsys.readouterr().err
 
 
+def test_bad_inputs_beyond_the_config_fail_with_a_message(tmp_path, capsys, data):
+    # A directory for a config, a place without a longitude, a wrong variable name in the data files.
+    assert run.main(["run", str(tmp_path), "--out", str(tmp_path / "out")]) == 1
+    assert "Is a directory" in capsys.readouterr().err
+    config = write_world(tmp_path / "places", CONFIG)
+    (config.parent / "places.yaml").write_text(PLACES.replace("lon: -80.3, ", "", 1))
+    assert run.main(["run", str(config), "--out", str(tmp_path / "out")]) == 1
+    assert "departure 'Puerto': no lon" in capsys.readouterr().err
+    environment = {**FILES_CONFIG["environment"], "wind": {"paths": "era5/era5_uv10_*.nc", "u": "u100"}}
+    config = write_world(data.parent, {**FILES_CONFIG, "environment": environment})
+    assert run.main(["run", str(config), "--out", str(tmp_path / "out")]) == 1
+    assert "has no variable 'u100'; it has ['u10', 'v10']" in capsys.readouterr().err
+    assert not (tmp_path / "out").exists()
+
+
 def test_fetch_dry_runs_list_their_downloads(tmp_path, capsys, monkeypatch):
     def refuse(*args, **kwargs):
         raise AssertionError("network access in a test")
@@ -467,6 +710,32 @@ def test_fetch_dry_runs_list_their_downloads(tmp_path, capsys, monkeypatch):
     assert run.main(["fetch", "enso", "--out", str(tmp_path), "--dry-run"]) == 0
     assert len(capsys.readouterr().out.splitlines()) == len(fetch.ENSO_FILES)
     assert run._ints("2010-2012,2015") == [2010, 2011, 2012, 2015]
+    # A reversed range is an error, not "nothing to fetch"; so is an hour that does not exist.
+    for args, message in ((["--years", "2019-2010"], "ends before it starts"),
+                          (["--years", "2010", "--months", "3-1"], "ends before it starts"),
+                          (["--years", "2010", "--months", "1", "--hours", "25"], "bad hour 25")):
+        assert run.main(["fetch", "era5", *args, "--out", str(tmp_path), "--dry-run"]) == 1
+        assert message in capsys.readouterr().err
+
+
+def test_reruns_in_new_processes_are_byte_identical(tmp_path):
+    # A rerun is a new Python process with its own string-hash seed: nothing written may depend on set or
+    # hash order. The synthetic demo has many destination groups per cell (eight islands, six coasts).
+    doc = yaml.safe_load((ROOT / "configs" / "synthetic_demo.yaml").read_text(encoding="utf-8"))
+    doc["catalog"] = {**doc["catalog"], "config": str(ROOT / "configs" / doc["catalog"]["config"]),
+                      "cache_dir": str(tmp_path / "cache")}
+    doc.update(vessels=str(ROOT / "configs" / doc["vessels"]), places=str(ROOT / "configs" / doc["places"]),
+               launches={**doc["launches"], "every_days": 61}, rules=doc["rules"][:1],
+               raster={**doc["raster"], "res_deg": 0.2}, analysis={**doc["analysis"], "supplies": [30]},
+               cells=[{**cell, "max_days_at_sea": 30} for cell in doc["cells"]])
+    config = tmp_path / "demo.yaml"
+    config.write_text(yaml.safe_dump(doc, sort_keys=False))
+    outs = []
+    for seed in ("1", "2"):
+        outs.append(tmp_path / f"out{seed}")
+        subprocess.run([sys.executable, "-m", "voyage_sim", "run", str(config), "--out", str(outs[-1])],
+                       env={**os.environ, "PYTHONHASHSEED": seed}, check=True, capture_output=True)
+    assert files(outs[0]) == files(outs[1])
 
 
 def test_python_dash_m_runs_the_command_line(tmp_path):

@@ -340,11 +340,13 @@ class LandfallDetector:
             if r.index.size and r.index.max() >= len(self.landmasses):
                 raise ValueError(f"raster {r.rule_name!r} refers to more than {len(self.landmasses)} landmasses")
 
-    def check_segment(self, lon0, lat0, lon1, lat1, origin_group, armed, active, eligible=None, rules=None):
+    def check_segment(self, lon0, lat0, lon1, lat1, origin_group, armed, active, eligible=None, rules=None,
+                      return_exact=False):
         """Where along each step's segment land first comes into sight, per rule.
 
         The segment runs linearly in lon/lat from (lon0, lat0) to (lon1, lat1).
-        ``origin_group`` is each voyage's home group index (-1 for none).
+        ``origin_group`` is each voyage's home group index (-1 for none), or an
+        (n, n_groups) bool mask of its home groups.
         ``eligible``, optional (n, n_groups) bool, marks the groups each voyage
         may land on (its destinations); land of other groups is sailed past,
         though it still keeps a voyage from being out of sight of all land.
@@ -354,7 +356,9 @@ class LandfallDetector:
         Returns ``(hit, frac, landmass, armed_new)``, each (len(rules), n):
         whether land that counts came into sight, where along the segment (frac
         in [0, 1], NaN if not), which landmass (-1 if not), and the updated
-        armed flags.
+        armed flags. With ``return_exact``, also ``exact``: False where the
+        sighting was placed at a switch from land in sight that does not count
+        (see the limitation below), so it may have come into sight earlier.
 
         A segment is skipped, as wholly out of sight, when
         ``min(margin_start, margin_end) > 0.75 * length + cell_km``. That is
@@ -366,7 +370,7 @@ class LandfallDetector:
         linear interpolation of the margin between the samples around it.
 
         Home exclusion: a voyage starts in sight of its home islands, so
-        sightings of its origin group count only once it has been out of sight
+        sightings of its home groups count only once it has been out of sight
         of all land (margin > 0) at some point, in an earlier step or earlier in
         this segment. Inactive voyages, and segments with a non-finite end, get
         no sighting and keep their armed flag.
@@ -375,25 +379,29 @@ class LandfallDetector:
         cell, so where an eligible landmass's sighting zone overlaps that of an
         ineligible one with a smaller margin there (or of a home landmass not
         yet armed), the eligible one is sighted only where its own margin takes
-        over. In the study area that would matter for small islands just off the
-        American coast (Gorgona, La Plata, Isla Mocha, ...) if they were grouped
-        apart from their coast segment (the catalog joins them to it): each would
-        hide the coast behind it along 40-150 km of shore, where the coast would
-        be sighted 10-60 km later, or not at all. Eastern Polynesian groups lie
-        hundreds of km from non-destination land.
+        over, and that switch is not interpolated (``exact`` is False). For
+        destinations this matters little in the study area: the catalog joins
+        small islands just off the American coast (Gorgona, La Plata, Isla
+        Mocha, ...) to their coast segment, and eastern Polynesian groups lie
+        hundreds of km from non-destination land. It does matter for other land
+        sighted near home, whose zone overlaps the home zone: a voyage leaving
+        the South Marquesas sights the North Marquesas (Ua Pou) only where their
+        margin takes over from its unarmed home's, often days late and tens of
+        km inside their range, and the same holds for a coast segment next to a
+        departure port.
         """
         lon0, lat0, lon1, lat1 = np.broadcast_arrays(
             *(np.asarray(x, dtype=float) for x in (lon0, lat0, lon1, lat1)))
         n = lon0.shape[0]
-        origin_group = np.broadcast_to(np.asarray(origin_group), lon0.shape)
+        origin_group = np.asarray(origin_group)
+        home = None
+        if origin_group.dtype == bool:
+            home = self._group_mask(origin_group, n, "origin_group")
+        else:
+            origin_group = np.broadcast_to(origin_group, lon0.shape)
         rasters = list(self.rasters) if rules is None else [self.rasters[r] for r in rules]
         if eligible is not None:
-            eligible = np.asarray(eligible, dtype=bool)
-            if eligible.shape != (n, len(self.groups)):
-                raise ValueError(f"eligible must have shape (n, n_groups) = {(n, len(self.groups))}, "
-                                 f"got {eligible.shape}")
-            # A trailing False column for group -1 (no landmass).
-            eligible = np.hstack([eligible, np.zeros((n, 1), dtype=bool)])
+            eligible = self._group_mask(eligible, n, "eligible")
         shape = (len(rasters), n)
         armed_new = np.broadcast_to(np.asarray(armed, dtype=bool), shape).copy()
         finite = np.isfinite(lon0) & np.isfinite(lat0) & np.isfinite(lon1) & np.isfinite(lat1)
@@ -401,6 +409,7 @@ class LandfallDetector:
         hit = np.zeros(shape, dtype=bool)
         frac = np.full(shape, np.nan)
         landmass = np.full(shape, -1, dtype=np.int64)
+        exact = np.zeros(shape, dtype=bool)
 
         length = geo.haversine_km(lon0, lat0, lon1, lat1)
         dlon = geo.angle_diff(lon1, lon0)
@@ -423,7 +432,8 @@ class LandfallDetector:
             out_of_sight = m > 0
             armed_so_far = armed_new[r, cand][:, None] | np.logical_or.accumulate(out_of_sight, axis=1)
             group = self._group_of[idx]
-            counts = ~out_of_sight & (idx >= 0) & ((group != origin_group[cand, None]) | armed_so_far)
+            is_home = group == origin_group[cand, None] if home is None else home[cand[:, None], group]
+            counts = ~out_of_sight & (idx >= 0) & (~is_home | armed_so_far)
             if eligible is not None:
                 counts &= eligible[cand[:, None], group]
 
@@ -441,8 +451,18 @@ class LandfallDetector:
             hit[r, cand] = seen
             frac[r, cand[seen]] = f[seen]
             landmass[r, cand[seen]] = idx[rows, k][seen]
+            exact[r, cand[seen]] = (crossing | (k == 0))[seen]
             armed_new[r, cand] |= out_of_sight.any(axis=1)
+        if return_exact:
+            return hit, frac, landmass, armed_new, exact
         return hit, frac, landmass, armed_new
+
+    def _group_mask(self, mask, n, what):
+        """An (n, n_groups) bool mask, with a trailing False column for group -1 (no landmass)."""
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != (n, len(self.groups)):
+            raise ValueError(f"{what} must have shape (n, n_groups) = {(n, len(self.groups))}, got {mask.shape}")
+        return np.hstack([mask, np.zeros((n, 1), dtype=bool)])
 
 
 # --- catalog and shorelines ---------------------------------------------------

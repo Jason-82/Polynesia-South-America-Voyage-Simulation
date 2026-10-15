@@ -15,6 +15,8 @@ every step.
 Strategies keep per-voyage memory (tack, route phase) as arrays in a dict from
 ``init_state``; ``heading`` updates them in place, only for active voyages.
 Strategies read two things from the vessel: ``min_twa_deg`` and ``can_sail``.
+A rule that sails no closer to the wind than the vessel could says so in
+``closest_twa_deg``, and the simulator holds steering error to that limit.
 """
 
 from __future__ import annotations
@@ -114,6 +116,11 @@ class Strategy:
         """Where a voyage waiting in port leaves now (default: at once)."""
         return np.ones(np.shape(ctx.lon), dtype=bool)
 
+    def closest_twa_deg(self, vessel: Vessel) -> float:
+        """The closest angle to the wind this rule ever sails ``vessel`` at; the simulator keeps
+        steering error and wind shifts outside it too. Default: the vessel's own limit."""
+        return vessel.min_twa_deg
+
     def heading(self, state, ctx: StepContext) -> np.ndarray:
         """Compass heading to steer; NaN = do not steer, always for inactive voyages
         and for vessels that cannot sail. Updates ``state`` only where ``ctx.active``."""
@@ -155,8 +162,11 @@ class Downwind(Strategy):
     def init_state(self, n):
         return {"tack": np.zeros(n, dtype=np.int8)}
 
+    def closest_twa_deg(self, vessel):
+        return max(vessel.min_twa_deg, self.min_twa_deg)
+
     def _choose(self, state, ctx):
-        limit = max(ctx.vessel.min_twa_deg, self.min_twa_deg)
+        limit = self.closest_twa_deg(ctx.vessel)
         desired = _bearing_to_target(ctx)
         # Zero hysteresis makes steer_toward an exact clamp to the nearer cone edge.
         heading = _steer(state, ctx, desired, limit, 0.0)

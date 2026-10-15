@@ -16,7 +16,8 @@
 # may wait 60 days and sail 90, the raft drifts 120, so winds and currents are
 # needed to the end of May 2020. ERA5 needs a Climate Data Store account and
 # GLORYS a Copernicus Marine one (voyage_sim.fetch). Each launch month reads
-# about five months of 6-hourly winds (~0.6 GB) and 0.25 deg currents.
+# about six months (the month, a 60-day wait and a 90-day horizon) of 6-hourly
+# winds (~0.75 GB) and 0.25 deg currents; reading takes ~1.3 times that.
 #
 # Two vessels and their strategies: the upwind canoe holding course for the
 # far side, or waiting in port for a wind that lets it lay the course; and the

@@ -95,12 +95,16 @@ def duration_summary(days) -> dict:
     return dict(median=float(median), p90=float(p90), n=int(d.size))
 
 
-def launch_labels(results, phases: pd.Series | None = None, index: pd.Series | None = None) -> pd.DataFrame:
+def launch_labels(results, phases: pd.Series | None = None, index: pd.Series | None = None,
+                  source: pd.Series | None = None) -> pd.DataFrame:
     """Per-voyage labels for ``summarize``, from each voyage's launch time (UTC).
 
     Columns: ``voyage_id``; ``month`` (1-12); ``enso``, the phase of the launch
     month in ``phases`` (``enso.enso_phases`` output; ``"unknown"`` where it has
-    none, or without it); ``year``, the July-June year (``enso.enso_year``) that
+    none, or without it); ``enso_source``, the name of the index that labels
+    the launch month in ``source`` (monthly, like ``phases``; without it
+    ``"index"`` wherever ``phases`` labels the month), ``"unknown"`` where none
+    does; ``year``, the July-June year (``enso.enso_year``) that
     clusters the bootstrap; ``index``, the launch month's index value (NaN where
     missing, or without ``index``); and ``event``, the El Nino or La Nina event
     the launch falls in, named by phase and first month (``"el_nino:1997-05"``),
@@ -115,11 +119,16 @@ def launch_labels(results, phases: pd.Series | None = None, index: pd.Series | N
         phase = enso.label_times(t, phases)
         event = enso.label_times(t, _events(phases))
         event[event == enso.UNKNOWN] = None
+    if source is None:
+        named = np.where(phase == enso.UNKNOWN, enso.UNKNOWN, "index").astype(object)
+    else:
+        named = np.where(phase == enso.UNKNOWN, enso.UNKNOWN, enso.label_times(t, source)).astype(object)
     return pd.DataFrame(
         {
             "voyage_id": np.asarray(results.voyage_id),
             "month": geo.month_of(t),
             "enso": phase,
+            "enso_source": named,
             "year": enso.enso_year(t),
             "index": np.full(n, np.nan) if index is None else enso.index_at_times(t, index),
             "event": event,

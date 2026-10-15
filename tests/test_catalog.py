@@ -272,6 +272,39 @@ def test_cut_shares_crossing_points():
         np.testing.assert_array_equal(a[-1], b[0])
 
 
+INLET = """
+domain: [-100.0, -60.0, -30.0, 10.0]
+pacific_mask: [[-100.5, -31.0], [-70.0, -31.0], [-70.0, 11.0], [-100.5, 11.0]]
+groups: []
+coast:
+  relief_csv: relief.csv
+  relief_source: relief table
+  segments:
+    - {name: "Coast: A", region: americas, north: 1.0, south: -1.0}
+  placeholder:
+    - [[-80.0, 1.0], [-80.0, -0.6], [-79.2, -0.6], [-79.2, -0.1], [-79.0, -0.1], [-79.0, -0.7], [-80.0, -0.7],
+       [-80.0, -1.0]]
+"""
+
+
+def test_a_gulf_open_coast_does_not_take_the_relief_of_its_inner_shore(tmp_path):
+    # An inlet 0.8-1 deg east of the open coast cuts the band 0.2-0.3S, whose highest ground (900 m) is on its
+    # inner shore at 79.0W. The open coast, 110 km away, takes the relief of the nearest band whose high
+    # point lies on it (the higher of the two neighbours); the inlet's shores keep the band's own.
+    lats = np.round(np.arange(0.95, -1.0, -0.1), 2)
+    height = {-0.25: 900.0, -0.35: 120.0}
+    (tmp_path / "relief.csv").write_text("lat,max5,lon5\n" + "".join(
+        f"{lat},{height.get(lat, 100.0)},{-79.0 if lat == -0.25 else -80.0}\n" for lat in lats))
+    (tmp_path / "landmasses.yaml").write_text(INLET)
+    lms = by_name(catalog.build_catalog(tmp_path / "landmasses.yaml"))
+    inner, outer = lms["Coast: A 0.20S-0.30S"], lms["Coast: A 0.20S-0.30S (relief at 0.35S)"]
+    assert inner.height_m == 900.0 and set(np.vstack(inner.rings)[:, 0]) == {-79.2, -79.0}
+    assert outer.height_m == 120.0 and set(np.vstack(outer.rings)[:, 0]) == {-80.0}
+    assert outer.source == "relief table (band at 0.35S)" and outer.group == "Coast: A"
+    # Bands whose high point is on their only shore are as before.
+    assert lms["Coast: A 0.80S-0.90S"].height_m == 100.0 and "Coast: A 0.80S-0.90S (relief" not in str(list(lms))
+
+
 # --- placeholder mode and the cache -----------------------------------------------------
 
 def test_placeholder_without_gshhg(world, tmp_path, caplog):
@@ -396,6 +429,23 @@ def test_real_gshhg_catalog():
 
     pieces = np.vstack([r for lm in cat.landmasses if lm.kind == "coast" for r in lm.rings])
     assert pieces[:, 1].min() == pytest.approx(-50.0, abs=0.05) and pieces[:, 1].max() == pytest.approx(30.0, abs=0.05)
+    # Each band's westmost (open-ocean) shore takes relief measured within ~10 km of it, not that of a gulf's
+    # inner shore (Guayaquil, Reloncavi) up to 1.6 deg east.
+    relief = pd.read_csv(ROOT / "configs" / "coast_relief.csv", comment="#")
+    lon5 = dict(zip(catalog._band(relief["lat"].to_numpy(), 0.1).tolist(), relief["lon5"]))
+    westmost = {}
+    for lm in cat.landmasses:
+        if lm.kind != "coast" or not lm.source.startswith("Copernicus"):
+            continue
+        verts = np.vstack(lm.rings)
+        band_name, _, borrowed = lm.name.partition(" (relief at ")   # "2.25S)": the source band's centre
+        lat = float(borrowed[:-2]) * (1 if borrowed[-2] == "N" else -1) if borrowed else verts[:, 1].mean()
+        km = catalog._lon_km(verts, lon5[int(catalog._band(lat, 0.1))])
+        if band_name not in westmost or verts[:, 0].min() < westmost[band_name][0]:
+            westmost[band_name] = (verts[:, 0].min(), km, lm.height_m)
+    assert max(km for _, km, _ in westmost.values()) < 15.0
+    assert westmost["Coast: Ecuador 2.30S-2.40S"][2] < 100.0                 # not 637 m (inner Gulf of Guayaquil)
+    assert westmost["Coast: Central Chile 41.40S-41.50S"][2] < 600.0          # not 1726 m (Reloncavi Sound)
     # No Caribbean or Gulf of Mexico shore.
     assert pieces[pieces[:, 1] > 7.2, 0].max() < -77.5
     assert pieces[pieces[:, 1] > 17.0, 0].max() < -100.0
